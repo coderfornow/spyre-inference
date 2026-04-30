@@ -8,7 +8,6 @@ A vLLM platform plugin for IBM Spyre AI accelerators.
 
 This plugin leverages `torch-spyre` to utilize PyTorch's native Inductor compiler backend, enabling optimized model execution on Spyre devices through vLLM's plugin architecture.
 
-
 ## Requirements
 
 - Python >= 3.11
@@ -46,6 +45,7 @@ llm = LLM(
 ## Testing
 
 The test suite includes:
+
 - **Local tests** (`-m spyre`) - Spyre-specific functionality validation
 - **Upstream tests** (`-m upstream`) - vLLM compatibility verification
 
@@ -54,6 +54,7 @@ Upstream tests are automatically synced from the vLLM repository at the commit s
 ## Contributing
 
 See [Contributing Guide](docs/contributing/README.md) for:
+
 - Issue reporting and feature requests
 - Development setup
 - Testing guidelines
