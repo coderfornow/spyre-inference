@@ -1,0 +1,337 @@
+##############################################
+# Dockerfile.app.s390x
+#
+# Application image built on top of the spyre-toolchain image produced by
+# Dockerfile.base.s390x. Layers vllm + opencv + hf-xet + numactl + spyre-
+# inference on top, in a multi-stage build mirroring
+# aiu-inference-dev/Dockerfile.s390x but installing into system Python
+# (the spyre-granite-eval / toolchain image pattern, not /opt/vllm).
+#
+# Stages:
+#   builder-base                — inherits envs from toolchain (VIRTUAL_ENV=
+#                                 /usr/local, UV_SYSTEM_PYTHON=1, ...)
+#   numa-build                  — numactl 2.0.18 -> /opt/numactl
+#   rust                        — rustup stable for hf-xet build
+#   hf-xet-builder              — hf-xet 1.4.3 wheel
+#   opencv-builder              — opencv-python-headless==4.12.0.88 wheel
+#   vllm-builder                — vllm v0.20.1 wheel + install
+#   spyre-inference-builder     — spyre-inference wheel + install
+#   runtime-base                — clean FROM target for release
+#   release                     — final image, USER 1234:0, EXPOSE 8000
+#   dev                         — adds nano/sudo + test deps
+#
+# Build (after building Dockerfile.base.s390x as localhost/spyre-toolchain:s390x):
+#   podman build \
+#       --build-arg BASE_IMAGE=localhost/spyre-toolchain:s390x \
+#       --build-arg VLLM_VERSION=v0.20.1 \
+#       -f Dockerfile.app.s390x \
+#       --target release \
+#       -t localhost/spyre-inference:s390x \
+#       /Users/ritikdhiranan/PycharmProjects/spyre-inference
+#
+# Run (single-card debug on a multi-AIU host):
+#   grp=$(readlink /sys/bus/pci/devices/0009:00:00.0/iommu_group | xargs basename)
+#   podman run --rm -it \
+#       --device /dev/vfio/vfio --device /dev/vfio/$grp \
+#       --cap-add=IPC_LOCK --ulimit memlock=-1:-1 --shm-size=8g \
+#       -e SPYRE_SINGLE_CARD_BDF=0009:00:00.0 \
+#       -e FLEX_DEVICE=PF \
+#       -e VLLM_MODEL_PATH=/path/to/model \
+#       --entrypoint /bin/bash localhost/spyre-inference:s390x -l
+#
+# NB: spyre-inference currently supports PF (Physical Function) only; VF
+# is not implemented. FLEX_DEVICE defaults to PF below.
+##############################################
+
+ARG BASE_IMAGE="localhost/spyre-toolchain:s390x"
+ARG VLLM_VERSION="v0.20.1"
+ARG SPYRE_INFERENCE_REF="main"
+ARG PYTHON_VERSION="3.12"
+
+##############################################
+# builder-base — inherits everything from the toolchain image (system-Python
+# uv env, ${SENTIENT_BASE_INSTALL_DIR}, LD_LIBRARY_PATH, rust/openssl envs).
+##############################################
+FROM ${BASE_IMAGE} AS builder-base
+
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+USER root
+SHELL ["/usr/bin/bash", "-lc"]
+
+##############################################
+# numa-build — produces /opt/numactl
+# vllm._C.so dlopens libnuma.so.1 at import time; the base image ships
+# numactl-libs already, but a self-built numactl gives us static libnuma.a
+# for the vllm wheel link step.
+##############################################
+FROM builder-base AS numa-build
+
+WORKDIR /tmp
+RUN curl -LO https://github.com/numactl/numactl/archive/refs/tags/v2.0.18.tar.gz && \
+    tar -xvzf v2.0.18.tar.gz && \
+    cd numactl-2.0.18 && \
+    ./autogen.sh && \
+    ./configure --prefix=/opt/numactl && \
+    make -j"$(nproc)" && \
+    make install
+
+##############################################
+# rust — rustup stable, mounted into hf-xet-builder + spyre-inference build.
+##############################################
+FROM builder-base AS rust
+
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && \
+    . "$CARGO_HOME/env" && \
+    rustup default stable && \
+    rustup show
+
+##############################################
+# hf-xet-builder — HuggingFace xet wheel (no s390x prebuilt on PyPI).
+##############################################
+FROM builder-base AS hf-xet-builder
+
+ARG HF_XET_VERSION=1.4.3
+
+WORKDIR /tmp
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=rust,source=/root/.rustup,target=/root/.rustup,rw \
+    uv pip install --system --no-cache maturin patchelf && \
+    git clone --branch v${HF_XET_VERSION} --depth 1 https://github.com/huggingface/xet-core.git && \
+    cd xet-core/hf_xet/ && \
+    python3 -m maturin build --release --out dist && \
+    mkdir -p /tmp/hf-xet/dist && \
+    cp dist/*.whl /tmp/hf-xet/dist/
+
+##############################################
+# opencv-builder — opencv-python-headless==4.12.0.88 from source.
+# 4.13.0.90 has a libxcb packaging bug that breaks headless installs;
+# pyproject.toml override-dependencies pins 4.12.0.88 explicitly.
+##############################################
+FROM builder-base AS opencv-builder
+
+WORKDIR /tmp
+ARG OPENCV_VERSION=88
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --no-cache numpy setuptools wheel scikit_build build && \
+    git clone --recursive https://github.com/opencv/opencv-python.git -b ${OPENCV_VERSION} && \
+    cd opencv-python && \
+    python3 -m build --wheel --installer=uv --outdir /tmp/opencv-python/dist
+
+##############################################
+# vllm-builder — pin VLLM_VERSION, build CPU wheel against torch 2.11.
+##############################################
+FROM builder-base AS vllm-builder
+
+ARG VLLM_VERSION
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+ENV CXXFLAGS="-Wno-bool-compare"
+
+WORKDIR /usr/src
+
+# overrides.txt: packages we either pre-provide (torch, torchvision,
+# torch-sendnn, torch-spyre from the toolchain image; pyarrow, opencv,
+# hf-xet from builder stages) or skip entirely (numba/llvmlite have no
+# libLLVM-15.so on s390x; RH's vllm fork drops them too).
+RUN cat <<'EOF' > /usr/src/overrides.txt
+torch; sys_platform == 'never'
+torchaudio; sys_platform == 'never'
+torchvision; sys_platform == 'never'
+torch-sendnn; sys_platform == 'never'
+pyarrow; sys_platform == 'never'
+opentelemetry-sdk; sys_platform == 'never'
+opentelemetry-api; sys_platform == 'never'
+opentelemetry-exporter-otlp; sys_platform == 'never'
+opentelemetry-semantic-conventions-ai; sys_platform == 'never'
+opencv-python-headless; sys_platform == 'never'
+torch-spyre; sys_platform == 'never'
+torch_spyre; sys_platform == 'never'
+numba; sys_platform == 'never'
+llvmlite; sys_platform == 'never'
+llguidance>=1.7.3
+compressed-tensors==0.14.0.1
+EOF
+
+# Install the wheels we built in parallel stages into system Python.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=rust,source=/root/.rustup,target=/root/.rustup,rw \
+    --mount=type=bind,from=hf-xet-builder,source=/tmp/hf-xet/dist,target=/tmp/hf-xet-wheels/ \
+    --mount=type=bind,from=opencv-builder,source=/tmp/opencv-python/dist,target=/tmp/opencv-wheels/ \
+    uv pip install --system --no-cache \
+        $(ls /tmp/hf-xet-wheels/*.whl) \
+        $(ls /tmp/opencv-wheels/*.whl)
+
+# vllm wheel build. CMAKE_PREFIX_PATH steers cmake at the nanobind installed
+# by the toolchain image (uv pip install nanobind==2.9.2).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=rust,source=/root/.rustup,target=/root/.rustup,rw \
+    git clone https://github.com/vllm-project/vllm.git /usr/src/vllm && \
+    cd /usr/src/vllm && \
+    git checkout tags/${VLLM_VERSION} && \
+    uv pip install --system --no-cache \
+        --overrides /usr/src/overrides.txt \
+        -r requirements/cpu-build.txt && \
+    export CMAKE_PREFIX_PATH=$(python3 -m nanobind --cmake_dir):${CMAKE_PREFIX_PATH:-} && \
+    mkdir -p /tmp/vllm-wheels && \
+    VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 \
+        pip wheel --no-build-isolation --no-deps -w /tmp/vllm-wheels/ . && \
+    uv pip install --system --no-cache \
+        --overrides /usr/src/overrides.txt \
+        /tmp/vllm-wheels/vllm-*.whl
+
+##############################################
+# spyre-inference-builder — install spyre-inference into the same system
+# Python as vllm. Lock-pins filter strips packages we already provided.
+##############################################
+FROM vllm-builder AS spyre-inference-builder
+
+ARG SPYRE_INFERENCE_REF
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+# Use the local working tree so the Dockerfile pairs with the checked-out
+# source. (Alternative: git clone the public repo at SPYRE_INFERENCE_REF.)
+COPY . /usr/src/spyre-inference
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=rust,source=/root/.rustup,target=/root/.rustup,rw \
+    cd /usr/src/spyre-inference && \
+    uv export --frozen --no-dev --no-hashes --no-emit-project \
+        --format requirements-txt -o /usr/src/lock-pins.txt && \
+    grep -vE '^(torch|torchvision|torch-sendnn|hf-xet|opencv-python-headless|torch-spyre|torch_spyre|vllm|pyarrow|llvmlite|numba)([= ]|$)' \
+        /usr/src/lock-pins.txt > /usr/src/lock-constraints.txt && \
+    mkdir -p /tmp/spyre-wheels && \
+    pip wheel --no-build-isolation --no-deps -w /tmp/spyre-wheels/ . && \
+    uv pip install --system --no-cache \
+        --overrides /usr/src/overrides.txt \
+        --constraint /usr/src/lock-constraints.txt \
+        /tmp/spyre-wheels/spyre_inference-*.whl
+
+# Force pure-Python protobuf. The C++ extension crashes on big-endian
+# s390x; pairs with PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python in release.
+RUN find /usr/local/lib64/python${PYTHON_VERSION}/site-packages -name '_message*.so'          -path '*/google/protobuf/*' -delete && \
+    find /usr/local/lib64/python${PYTHON_VERSION}/site-packages -name '_api_implementation*.so' -path '*/google/protobuf/*' -delete
+
+# Smoke test the assembled environment.
+RUN python3 -c "import torch, torch_spyre, torch_sendnn, vllm, spyre_inference; \
+                print('app ok:', torch.__version__, spyre_inference.__name__)"
+
+##############################################
+# runtime-base — clean FROM target for release. Toolchain image already has
+# all the runtime libs; this stage exists so release doesn't carry builder
+# cruft. No extra DNF installs needed.
+##############################################
+FROM ${BASE_IMAGE} AS runtime-base
+
+USER root
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+##############################################
+# release — final image for serving. Copies the assembled system-Python
+# site-packages from spyre-inference-builder over the toolchain's, drops
+# numactl, sets LD_LIBRARY_PATH, ENV, profile.d defenses, ENTRYPOINT.
+##############################################
+FROM runtime-base AS release
+
+ARG PYTHON_VERSION
+
+# Copy the built site-packages over the base. This is the system-Python
+# equivalent of `COPY --from=… /opt/vllm /opt/vllm` in aiu-inference-dev.
+COPY --from=spyre-inference-builder /usr/local/lib64/python${PYTHON_VERSION}/site-packages \
+                                    /usr/local/lib64/python${PYTHON_VERSION}/site-packages
+COPY --from=spyre-inference-builder /usr/local/bin /usr/local/bin
+
+# numactl static + dynamic libs.
+COPY --from=numa-build /opt/numactl/. /usr/local/
+RUN ldconfig
+
+# LD_LIBRARY_PATH ordering — our rebuilt flex/deeptools/libaiupti BEFORE the
+# base image's /opt/ibm/spyre/*/lib RPM versions. Non-login processes
+# (ENTRYPOINT) inherit this; login shells go through /etc/profile.d/
+# (zz-flex-overlay.sh below has the last word).
+ENV LD_LIBRARY_PATH="${SENTIENT_BASE_INSTALL_DIR}/runtime/lib:${SENTIENT_BASE_INSTALL_DIR}/deeptools/lib:${SENTIENT_BASE_INSTALL_DIR}/libaiupti/lib:${SENTIENT_BASE_INSTALL_DIR}/spyre_comms/lib:/usr/local/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/spyre-comms/lib:/usr/local/lib"
+
+# Defense-in-depth profile.d scripts. The base image's
+# /etc/profile.d/ibm-aiu-setup.sh runs on login shells and re-prepends
+# /opt/ibm/spyre/*/lib to LD_LIBRARY_PATH (demoting our overlay). The
+# zz- prefix sorts alphabetically AFTER ibm-aiu-setup.sh so these win.
+COPY ./container-scripts/zz-flex-overlay.sh    /etc/profile.d/zz-flex-overlay.sh
+COPY ./container-scripts/zz-aiu-single-card.sh /etc/profile.d/zz-aiu-single-card.sh
+RUN chmod 0644 /etc/profile.d/zz-flex-overlay.sh /etc/profile.d/zz-aiu-single-card.sh
+
+# Environment for spyre-inference + vllm runtime.
+# FLEX_DEVICE=PF — spyre-inference only supports PF; VF is not implemented.
+ENV DTLOG_COLOR=0 \
+    DTLOG_LEVEL=error \
+    DT_DEEPRT_VERBOSE="-1" \
+    MASTER_ADDR=localhost \
+    MASTER_PORT=12355 \
+    TOKENIZERS_PARALLELISM=false \
+    TORCH_SENDNN_LOG=CRITICAL \
+    VLLM_PLUGINS=spyre_inference \
+    FLEX_DEVICE=PF \
+    FLEX_COMPUTE=SENTIENT \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
+# Helper scripts to reconfigure aius at runtime and set aiu env vars.
+COPY ./container-scripts /home/senuser/container-scripts
+RUN chmod +x /home/senuser/container-scripts/*.sh || true
+
+RUN mkdir -p /home/senuser/.cache && \
+    chmod -R g+rwx /home/ && \
+    chown -R senuser:0 /home/
+
+ENV HOME=/home/senuser \
+    PATH=/home/senuser/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+WORKDIR ${HOME}
+
+# senuser's UID is 1234 (base image convention)
+USER 1234:0
+
+# Default vLLM OpenAI server endpoint
+EXPOSE 8000
+
+# Start vllm in server mode. User must provide VLLM_MODEL_PATH (or pass the
+# model as a positional arg) and VLLM_AIU_PCIE_IDS if running with a subset
+# of AIUs. For single-card debug, also set SPYRE_SINGLE_CARD_BDF.
+ENTRYPOINT ["/home/senuser/container-scripts/vllm_start_s390x.sh"]
+
+##############################################
+# dev — release + nano/sudo + the spyre-inference dev-group test deps.
+##############################################
+FROM release AS dev
+
+USER root
+
+RUN dnf install -y nano sudo vim && \
+    dnf clean all
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=spyre-inference-builder,source=/usr/src/spyre-inference,target=/usr/src/spyre-inference \
+    cd /usr/src/spyre-inference && \
+    uv pip compile --group dev --no-deps > /tmp/requirements-test.txt && \
+    uv pip install --system --no-cache -r /tmp/requirements-test.txt
+
+USER 1234:0
+WORKDIR ${HOME}
+
+ENTRYPOINT ["/home/senuser/container-scripts/vllm_start_s390x.sh"]

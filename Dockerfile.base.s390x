@@ -1,0 +1,254 @@
+##############################################
+# Dockerfile.base.s390x
+#
+# Toolchain image: runs the canonical torch-spyre-docs build pipeline against
+# system Python in icr.io/ocp-ai-on-z/spyre-granite-eval. Produces a tagged
+# image with deeptools, flex, libaiupti, torch_sendnn, and torch-spyre all
+# built from source at the pins matching spyre-inference/pyproject.toml.
+#
+# Why this image exists:
+#   - The base spyre-granite-eval image ships torch_spyre as a broken editable
+#     install shim (finder points at a deleted /workspace/torch-spyre) and
+#     libflex.so at commit d19074e5 (missing 3-arg RuntimeOperationCompute /
+#     setPipelineBarrier symbols needed by newer torch-spyre).
+#   - The base image is also built against torch 2.10.0+cpu but the upstream
+#     torch-spyre / torch-sendnn branches have been updated for torch 2.11.0+cpu.
+#     We uninstall the 2.10 stack and reinstall 2.11.0+cpu from the pytorch-cpu
+#     index (which publishes manylinux2014_s390x wheels) before rebuilding.
+#
+# Bridges the venv/system-Python gap:
+#   torch-spyre-docs scripts (dev-env.sh, build-torch-spyre.sh) assume an
+#   activated venv at ${DTI_PROJECT_ROOT}/.venv. We sed dev-env.sh into
+#   dev-env-system.sh that points at /usr/local instead, and export
+#   VIRTUAL_ENV=/usr/local + UV_PROJECT_ENVIRONMENT=/usr/local so uv treats
+#   system Python as the "active" environment.
+#
+# Build:
+#   eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519_gh ~/.ssh/id_ed25519_ghe
+#   cd /Users/ritikdhiranan/PycharmProjects
+#   podman build --ssh default=$SSH_AUTH_SOCK \
+#       --build-arg GITHUB_USER=$(git config --get github.user) \
+#       --build-arg NIGHTLY_DATE=latest \
+#       -f spyre-inference/Dockerfile.base.s390x \
+#       -t localhost/spyre-toolchain:s390x \
+#       .
+#
+# Build context note: must be the parent of both spyre-inference/ and
+# torch-spyre-docs/ so the COPY ./torch-spyre-docs line resolves.
+##############################################
+
+ARG NIGHTLY_DATE="latest"
+ARG BASE_IMAGE="icr.io/ocp-ai-on-z/spyre-granite-eval:${NIGHTLY_DATE}"
+
+FROM ${BASE_IMAGE} AS toolchain
+
+ARG GITHUB_USER
+ARG TORCH_VERSION="2.11.0"
+# torch-spyre pin from spyre-inference/pyproject.toml:96
+ARG TORCH_SPYRE_REF="539a1a0c2d54b228c19c982ee80044e210bcde98"
+# LLVM pin from torch-spyre-docs/scripts/checkout-required-src.sh:876
+ARG LLVM_COMMIT="dd6f6a096a59892ce1f9c454461aa5ed4c2aa971"
+ARG PYTHON_VERSION="3.12"
+ARG MAX_JOBS="16"
+
+USER root
+SHELL ["/usr/bin/bash", "-lc"]
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHON_VERSION=${PYTHON_VERSION}
+
+##############################################
+# Step 1 — build toolchain deps. Most are already in the base image; this
+# is a superset of Dockerfile-patched.s390x:127-141 plus tools needed by the
+# torch-spyre-docs build scripts (cmake, ccache, jq, perl-core).
+##############################################
+RUN dnf install -y \
+        libsndfile \
+        libtiff-devel libpng-devel libwebp-devel \
+        freetype-devel harfbuzz-devel \
+        ninja-build \
+        autoconf automake libtool \
+        golang \
+        dnf-plugins-core \
+        libxml2-devel libxslt libxslt-devel \
+        gcc-gfortran \
+        libatomic-devel \
+        clang clang-devel libomp libomp-devel \
+        openssl openssl-devel pkgconf-pkg-config \
+        numactl-libs \
+        ccache jq perl-core \
+        cmake make git patch \
+        python3-devel && \
+    dnf clean all
+
+##############################################
+# Step 2 — scrub broken artifacts from the base image.
+#
+#   (a) Ghost torch_spyre editable shim: __editable__.torch_spyre-0.0.1.pth
+#       was installed via `uv pip install -e /workspace/torch-spyre` and the
+#       source dir was then removed, leaving a broken finder that shadows
+#       any future torch_spyre import. Must be removed before our rebuild.
+#
+#   (b) torch 2.10 stack + ABI-tied dependents: torch 2.10.0+cpu,
+#       torchvision 0.25.0, torch-sendnn 1.2.1+269 (built against 2.10),
+#       torchao 0.11.0, torch-spyre 0.0.1 (broken anyway). All replaced by
+#       torch 2.11.0+cpu installs in Step 3.
+##############################################
+RUN SP=/usr/local/lib64/python${PYTHON_VERSION}/site-packages && \
+    rm -f  $SP/__editable__.torch_spyre-0.0.1.pth \
+           $SP/__editable___torch_spyre_0_0_1_finder.py && \
+    rm -rf $SP/torch_spyre-0.0.1.dist-info
+
+RUN uv pip uninstall --system \
+        torch torchvision torchaudio torchao \
+        torch-sendnn torch-spyre 2>/dev/null || true
+
+##############################################
+# Step 3 — install torch 2.11.0+cpu and matching torchvision from the
+# pytorch-cpu index. PyTorch publishes manylinux2014_s390x wheels for
+# torch >= 2.4. If torch 2.11.0 ever lacks an s390x wheel, fall back to
+# building from source via torch-spyre-docs/scripts/build-pytorch.sh
+# (out of scope here).
+##############################################
+RUN uv pip install --system --no-cache \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==${TORCH_VERSION}" torchvision
+
+##############################################
+# Step 4 — workspace layout + env. Mirrors dev-env.sh but pinned at system
+# Python: VIRTUAL_ENV=/usr/local makes uv treat /usr/local as the active
+# environment, so `uv pip install` and `uv sync --active` both resolve into
+# /usr/local/lib64/python3.12/site-packages.
+##############################################
+ENV DTI_PROJECT_ROOT=/workspace/dt-inductor
+ENV SEN_PROJECT_SRC=${DTI_PROJECT_ROOT} \
+    SEN_PROJECT_BUILD=${DTI_PROJECT_ROOT}/build \
+    SENTIENT_BASE_INSTALL_DIR=${DTI_PROJECT_ROOT}/sentient \
+    DTI_LLVM_SRC_DIR=${DTI_PROJECT_ROOT}/llvm-project \
+    LLVM_PROJ_SRC=${DTI_PROJECT_ROOT}/llvm-project \
+    LLVM_PROJ_BUILD=${DTI_PROJECT_ROOT}/build/llvm \
+    LLVM_EXTERNAL_LIT=${DTI_PROJECT_ROOT}/build/llvm/bin/llvm-lit
+ENV DEEPTOOLS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/deeptools \
+    DEEPTOOLS_PATH=${SENTIENT_BASE_INSTALL_DIR}/deeptools/share \
+    RUNTIME_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    RUNTIME_FULL_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    SENDNN_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    SENDNN_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    LIBAIUPTI_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/libaiupti \
+    SPYRE_COMMS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms
+
+ENV PYTHONPATH=${SENTIENT_BASE_INSTALL_DIR}/runtime/lib \
+    PATH=${SENTIENT_BASE_INSTALL_DIR}/runtime/bin:${SENTIENT_BASE_INSTALL_DIR}/deeptools/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms/lib:${SENTIENT_BASE_INSTALL_DIR}/libaiupti/lib:${SENTIENT_BASE_INSTALL_DIR}/runtime/lib:${SENTIENT_BASE_INSTALL_DIR}/deeptools/lib:/usr/local/lib:/usr/lib64 \
+    MAX_JOBS=${MAX_JOBS}
+
+# System-Python redirection for uv. VIRTUAL_ENV=/usr/local mimics an active
+# venv whose prefix is system Python's prefix. uv `--active`, `--system`,
+# `pip install` all converge to /usr/local/lib64/python3.12/site-packages.
+ENV VIRTUAL_ENV=/usr/local \
+    UV_PROJECT_ENVIRONMENT=/usr/local \
+    UV_SYSTEM_PYTHON=1 \
+    UV_BREAK_SYSTEM_PACKAGES=1 \
+    UV_PYTHON_PREFERENCE=only-system \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# Rust/grpc/openssl crate build envs (carried over from
+# Dockerfile-patched.s390x:143-159).
+ENV LIBCLANG_PATH=/usr/lib64 \
+    OPENSSL_DIR=/usr \
+    OPENSSL_LIB_DIR=/usr/lib64 \
+    OPENSSL_INCLUDE_DIR=/usr/include \
+    OPENSSL_NO_VENDOR=1 \
+    GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 \
+    GRPC_PYTHON_DISABLE_LIBC_COMPILER_CHECK=1
+
+RUN mkdir -p ${DTI_PROJECT_ROOT}
+WORKDIR ${DTI_PROJECT_ROOT}
+
+##############################################
+# Step 5 — bootstrap the uv-managed build tools listed in dev_install.md.
+##############################################
+RUN uv pip install --system --no-cache \
+        "nanobind==2.9.2" ninja "pybind11==3.0.1" build "cmake~=3.26" regex wheel
+
+##############################################
+# Step 6 — bring torch-spyre-docs into the image and generate a system-Python
+# variant of dev-env.sh (dev-env-system.sh) that does NOT source any venv and
+# points UV_PROJECT_ENVIRONMENT at /usr/local.
+##############################################
+COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
+
+RUN sed -E \
+        -e 's|^source[[:space:]]+.*\.venv/bin/activate||' \
+        -e 's|^export[[:space:]]+UV_PROJECT_ENVIRONMENT=.*|export UV_PROJECT_ENVIRONMENT=/usr/local|' \
+        ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env.sh \
+    > ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env-system.sh && \
+    chmod +x ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env-system.sh
+
+##############################################
+# Step 7 — SSH host keys + clone all required sources via BuildKit SSH mount.
+# checkout-required-src.sh prompts for github.user; we pass GITHUB_USER as
+# build arg. If not provided, fall back to --no-fork to clone torch-spyre
+# directly from upstream torch-spyre/torch-spyre.
+##############################################
+RUN mkdir -p /root/.ssh && \
+    ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
+
+RUN --mount=type=ssh \
+    cd ${DTI_PROJECT_ROOT} && \
+    if [ -n "${GITHUB_USER}" ]; then \
+        ./torch-spyre-docs/scripts/checkout-required-src.sh \
+            --non-interactive --github-user "${GITHUB_USER}" --update ; \
+    else \
+        ./torch-spyre-docs/scripts/checkout-required-src.sh \
+            --non-interactive --no-fork --update ; \
+    fi
+
+##############################################
+# Step 8 — pin torch-spyre to the SHA in spyre-inference/pyproject.toml.
+# checkout-required-src.sh clones at main; we then check out the exact pin.
+##############################################
+RUN cd ${DTI_PROJECT_ROOT}/torch-spyre && \
+    git fetch --all --tags --prune && \
+    git checkout ${TORCH_SPYRE_REF}
+
+##############################################
+# Step 9 — build the AIU stack. LLVM must build first (it's outside the
+# build-everything.sh loop). build-everything.sh --tspyre then chains:
+# deeptools -> flex -> libaiupti -> torch_sendnn -> torch-spyre.
+#
+# Sourcing dev-env-system.sh in the same RUN keeps DTI_*/SENTIENT_* exports
+# live across all sub-scripts. The ccache cache mount accelerates re-runs.
+##############################################
+RUN --mount=type=cache,target=/root/.ccache \
+    set -e && \
+    cd ${DTI_PROJECT_ROOT} && \
+    . ./torch-spyre-docs/scripts/dev-env-system.sh && \
+    ./torch-spyre-docs/scripts/build-llvm-deeptools.sh && \
+    ./torch-spyre-docs/scripts/build-everything.sh --tspyre
+
+##############################################
+# Step 10 — smoke test. Must run with dev-env-system.sh sourced so
+# LD_LIBRARY_PATH points at the rebuilt flex/deeptools/libaiupti.
+##############################################
+RUN . ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env-system.sh && \
+    python3 -c "import torch, torch_spyre, torch_sendnn; \
+                print('toolchain ok:', torch.__version__, torch_spyre.__file__, torch_sendnn.__version__)"
+
+RUN nm -D ${RUNTIME_INSTALL_DIR}/lib/libflex.so | \
+        grep -E 'RuntimeOperationCompute|setPipelineBarrier' >/dev/null || \
+    { echo "ERROR: ${RUNTIME_INSTALL_DIR}/lib/libflex.so missing required symbols"; exit 1; }
+
+##############################################
+# Step 11 — slim the layer. Drop cmake build trees and the giant LLVM source
+# tree; install dirs and the freshly-installed Python packages are what the
+# app Dockerfile inherits. Keep ${SEN_PROJECT_SRC}/{flex,deeptools,libaiupti,
+# torch_sendnn,torch-spyre,spyre-comms,torch-spyre-docs} so the app stage can
+# still find flex headers (SEN_COMMON_HEADERS) if needed.
+##############################################
+RUN rm -rf ${SEN_PROJECT_BUILD} ${DTI_PROJECT_ROOT}/llvm-project
+
+# Final WORKDIR — downstream Dockerfile inherits.
+WORKDIR ${DTI_PROJECT_ROOT}
