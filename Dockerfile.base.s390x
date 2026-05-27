@@ -13,15 +13,16 @@
 #     setPipelineBarrier symbols needed by newer torch-spyre).
 #   - The base image is also built against torch 2.10.0+cpu but the upstream
 #     torch-spyre / torch-sendnn branches have been updated for torch 2.11.0+cpu.
-#     We uninstall the 2.10 stack and reinstall 2.11.0+cpu from the pytorch-cpu
-#     index (which publishes manylinux2014_s390x wheels) before rebuilding.
+#     We install torch 2.11.0+cpu from the pytorch-cpu index (which publishes
+#     manylinux2014_s390x wheels) into the venv before rebuilding.
 #
-# Bridges the venv/system-Python gap:
-#   torch-spyre-docs scripts (dev-env.sh, build-torch-spyre.sh) assume an
-#   activated venv at ${DTI_PROJECT_ROOT}/.venv. We sed dev-env.sh into
-#   dev-env-system.sh that points at /usr/local instead, and export
-#   VIRTUAL_ENV=/usr/local + UV_PROJECT_ENVIRONMENT=/usr/local so uv treats
-#   system Python as the "active" environment.
+# Python environment:
+#   torch-spyre-docs scripts (dev-env.sh, build-torch-spyre.sh) require an
+#   activated venv — build-torch-spyre.sh's `uv sync` rejects a non-venv
+#   prefix. We create ${DTI_PROJECT_ROOT}/.venv with --system-site-packages so
+#   it inherits the base image's /usr/local packages (transformers, etc.),
+#   while torch 2.11 / torch_sendnn / torch-spyre install into the venv and
+#   shadow the base image's torch 2.10. dev-env.sh activates this venv.
 #
 # Build:
 #   eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519_gh ~/.ssh/id_ed25519_ghe
@@ -46,13 +47,25 @@ ARG GITHUB_USER
 ARG TORCH_VERSION="2.11.0"
 # torch-spyre pin from spyre-inference/pyproject.toml:96
 ARG TORCH_SPYRE_REF="539a1a0c2d54b228c19c982ee80044e210bcde98"
+# flex pin compatible with TORCH_SPYRE_REF. checkout-required-src.sh clones
+# flex@main HEAD, which has moved ahead and removed the default value from
+# FlexAllocator::allocate(size_t, const AllocationDirective&) — torch-spyre
+# 539a1a0c (2026-05-11) calls the single-arg allocate(nbytes), so it needs a
+# flex where that default still exists. fbbcb975 is the last flex main commit
+# on/before torch-spyre 539a1a0c's date (2026-05-08), i.e. the flex HEAD that
+# 539a1a0c was developed against.
+ARG FLEX_REF="fbbcb9757be8966960ff28cc5b56d3f6e4f8e17e"
 # LLVM pin from torch-spyre-docs/scripts/checkout-required-src.sh:876
 ARG LLVM_COMMIT="dd6f6a096a59892ce1f9c454461aa5ed4c2aa971"
 ARG PYTHON_VERSION="3.12"
 ARG MAX_JOBS="16"
 
 USER root
-SHELL ["/usr/bin/bash", "-lc"]
+# Non-login shell: the base image's /etc/profile.d/ has a broken cp invocation
+# that spams stderr on every -lc shell startup. We don't need any of the base
+# image's profile.d exports at build time — all required env is set via ENV
+# directives below.
+SHELL ["/usr/bin/bash", "-c"]
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -73,53 +86,44 @@ RUN dnf install -y \
         dnf-plugins-core \
         libxml2-devel libxslt libxslt-devel \
         gcc-gfortran \
-        libatomic-devel \
-        clang clang-devel libomp libomp-devel \
+        clang clang-devel \
         openssl openssl-devel pkgconf-pkg-config \
         numactl-libs \
         ccache jq perl-core \
         cmake make git patch \
         python3-devel && \
     dnf clean all
+# Notes on dropped packages (not available in UBI 10 / el10 BaseOS+AppStream+CRB
+# for s390x, but the functionality is covered elsewhere):
+#   libatomic-devel   — s390x glibc provides libatomic at runtime; gcc-c++ has
+#                       the __atomic builtins / headers needed at build time.
+#   libomp libomp-devel — LLVM OpenMP runtime; not packaged on el10 s390x. GCC's
+#                       libgomp (shipped with gcc-c++ in the base image) covers
+#                       the OpenMP runtime needs of torch/vllm builds.
 
 ##############################################
-# Step 2 — scrub broken artifacts from the base image.
+# Step 2 — scrub the ghost torch_spyre editable shim from the base image.
+# __editable__.torch_spyre-0.0.1.pth was installed via
+# `uv pip install -e /workspace/torch-spyre`, then the source dir was removed,
+# leaving a broken finder that shadows any torch_spyre import. The venv we
+# build below uses --system-site-packages, so it WOULD inherit this broken
+# shim from /usr/local — scrub it before creating the venv.
 #
-#   (a) Ghost torch_spyre editable shim: __editable__.torch_spyre-0.0.1.pth
-#       was installed via `uv pip install -e /workspace/torch-spyre` and the
-#       source dir was then removed, leaving a broken finder that shadows
-#       any future torch_spyre import. Must be removed before our rebuild.
-#
-#   (b) torch 2.10 stack + ABI-tied dependents: torch 2.10.0+cpu,
-#       torchvision 0.25.0, torch-sendnn 1.2.1+269 (built against 2.10),
-#       torchao 0.11.0, torch-spyre 0.0.1 (broken anyway). All replaced by
-#       torch 2.11.0+cpu installs in Step 3.
+# We do NOT uninstall the base image's torch 2.10 stack: it lives in
+# /usr/local (RHEL's pip scheme), and our venv installs torch 2.11.0+cpu into
+# the venv's own site-packages, which takes precedence on sys.path. The base
+# 2.10 is simply shadowed.
 ##############################################
 RUN SP=/usr/local/lib64/python${PYTHON_VERSION}/site-packages && \
     rm -f  $SP/__editable__.torch_spyre-0.0.1.pth \
            $SP/__editable___torch_spyre_0_0_1_finder.py && \
     rm -rf $SP/torch_spyre-0.0.1.dist-info
 
-RUN uv pip uninstall --system \
-        torch torchvision torchaudio torchao \
-        torch-sendnn torch-spyre 2>/dev/null || true
-
 ##############################################
-# Step 3 — install torch 2.11.0+cpu and matching torchvision from the
-# pytorch-cpu index. PyTorch publishes manylinux2014_s390x wheels for
-# torch >= 2.4. If torch 2.11.0 ever lacks an s390x wheel, fall back to
-# building from source via torch-spyre-docs/scripts/build-pytorch.sh
-# (out of scope here).
-##############################################
-RUN uv pip install --system --no-cache \
-        --index-url https://download.pytorch.org/whl/cpu \
-        "torch==${TORCH_VERSION}" torchvision
-
-##############################################
-# Step 4 — workspace layout + env. Mirrors dev-env.sh but pinned at system
-# Python: VIRTUAL_ENV=/usr/local makes uv treat /usr/local as the active
-# environment, so `uv pip install` and `uv sync --active` both resolve into
-# /usr/local/lib64/python3.12/site-packages.
+# Step 3 — workspace layout + env. Follows dev-env.sh: all builds target a
+# uv venv at ${DTI_PROJECT_ROOT}/.venv created with --system-site-packages,
+# so the base image's /usr/local packages (transformers, etc.) stay visible
+# while torch 2.11 / torch_sendnn / torch-spyre install into the venv.
 ##############################################
 ENV DTI_PROJECT_ROOT=/workspace/dt-inductor
 ENV SEN_PROJECT_SRC=${DTI_PROJECT_ROOT} \
@@ -136,20 +140,35 @@ ENV DEEPTOOLS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/deeptools \
     SENDNN_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
     SENDNN_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
     LIBAIUPTI_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/libaiupti \
-    SPYRE_COMMS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms
+    SPYRE_COMMS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms \
+    SENLIB_INSTALL_DIR=/opt/ibm/spyre/senlib
+
+# flex's CMakeLists creates the SenLib::senlib imported target with include
+# dir ${SENLIB_PATH}/include. build-flex.sh passes -DSENLIB_PATH=${SENLIB_INSTALL_DIR};
+# if unset, that resolves to "/include" and cmake's generate step fails. We
+# don't build senlib from source (checkout-required-src.sh doesn't clone it),
+# so point at the base image's RPM senlib (verified to have include/ + lib/).
 
 ENV PYTHONPATH=${SENTIENT_BASE_INSTALL_DIR}/runtime/lib \
-    PATH=${SENTIENT_BASE_INSTALL_DIR}/runtime/bin:${SENTIENT_BASE_INSTALL_DIR}/deeptools/bin:/usr/local/bin:/usr/bin:/bin \
-    LD_LIBRARY_PATH=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms/lib:${SENTIENT_BASE_INSTALL_DIR}/libaiupti/lib:${SENTIENT_BASE_INSTALL_DIR}/runtime/lib:${SENTIENT_BASE_INSTALL_DIR}/deeptools/lib:/usr/local/lib:/usr/lib64 \
+    PATH=${DTI_PROJECT_ROOT}/.venv/bin:${SENTIENT_BASE_INSTALL_DIR}/runtime/bin:${SENTIENT_BASE_INSTALL_DIR}/deeptools/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms/lib:${SENTIENT_BASE_INSTALL_DIR}/libaiupti/lib:${SENTIENT_BASE_INSTALL_DIR}/runtime/lib:${SENTIENT_BASE_INSTALL_DIR}/deeptools/lib:/opt/ibm/spyre/senlib/lib:/usr/local/lib:/usr/lib64 \
     MAX_JOBS=${MAX_JOBS}
 
-# System-Python redirection for uv. VIRTUAL_ENV=/usr/local mimics an active
-# venv whose prefix is system Python's prefix. uv `--active`, `--system`,
-# `pip install` all converge to /usr/local/lib64/python3.12/site-packages.
-ENV VIRTUAL_ENV=/usr/local \
-    UV_PROJECT_ENVIRONMENT=/usr/local \
-    UV_SYSTEM_PYTHON=1 \
-    UV_BREAK_SYSTEM_PACKAGES=1 \
+# Route ALL C/C++ compiles through ccache. build-llvm-deeptools.sh does not
+# pass -DCMAKE_CXX_COMPILER_LAUNCHER, but CMake reads these env vars at
+# configure time and applies them, so the (expensive) LLVM build benefits
+# from the /root/.ccache cache mount on re-runs. CCACHE_MAXSIZE is bumped so
+# the full LLVM+MLIR object set isn't evicted mid-build.
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CCACHE_DIR=/root/.ccache \
+    CCACHE_MAXSIZE=30G
+
+# venv targeting for uv. The venv is created below; dev-env.sh activates it
+# during the build scripts, and these vars make uv target it for the RUN
+# steps that don't source dev-env.sh (torch install, bootstrap, smoke test).
+ENV VIRTUAL_ENV=${DTI_PROJECT_ROOT}/.venv \
+    UV_PROJECT_ENVIRONMENT=${DTI_PROJECT_ROOT}/.venv \
     UV_PYTHON_PREFERENCE=only-system \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
@@ -168,30 +187,68 @@ RUN mkdir -p ${DTI_PROJECT_ROOT}
 WORKDIR ${DTI_PROJECT_ROOT}
 
 ##############################################
-# Step 5 — bootstrap the uv-managed build tools listed in dev_install.md.
+# Step 4 — create the uv venv with --system-site-packages so it inherits the
+# base image's /usr/local packages, then install torch 2.11.0+cpu into the venv
+# (shadowing the base image's torch 2.10). PyTorch publishes manylinux2014_s390x
+# wheels for torch >= 2.4. If torch 2.11.0 ever lacks an s390x wheel, fall back
+# to build-pytorch.sh (out of scope here).
 ##############################################
-RUN uv pip install --system --no-cache \
+RUN uv venv --system-site-packages --python /usr/bin/python3.12 ${DTI_PROJECT_ROOT}/.venv
+
+RUN uv pip install --no-cache \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==${TORCH_VERSION}"
+
+##############################################
+# Step 4b — torchvision. Do NOT let the resolver pick it: the pytorch-cpu index
+# has no torchvision s390x wheel for torch 2.11, so it falls back to an ancient
+# PyPI sdist (0.1.6) whose `transforms` is a single module lacking
+# InterpolationMode — which transformers imports eagerly and hard-fails on at
+# model load. Instead install a prebuilt s390x torchvision wheel matching torch
+# 2.11 (e.g. torchvision-0.26.0+...-cp312-cp312-linux_s390x.whl) dropped into
+# the build context at ./spyre-inference/wheels/. --no-deps so it doesn't drag
+# torch off PyPI. If no wheel is provided, scrub any stray torchvision and fall
+# back to the base image's system torchvision 0.25.0 (its pure-Python
+# InterpolationMode enum is all transformers needs for text models).
+##############################################
+COPY ./spyre-inference/wheels/ /tmp/extra-wheels/
+RUN VENV_SP=${DTI_PROJECT_ROOT}/.venv/lib64/python${PYTHON_VERSION}/site-packages && \
+    rm -rf "${VENV_SP}/torchvision" "${VENV_SP}"/torchvision-*.dist-info && \
+    tv="$(ls /tmp/extra-wheels/torchvision-*.whl 2>/dev/null | head -1)" && \
+    if [ -n "${tv}" ]; then \
+        echo "Installing prebuilt torchvision wheel: ${tv}" && \
+        uv pip install --no-cache --no-deps "${tv}" && \
+        python3 -c "import torchvision; from torchvision.transforms import InterpolationMode; print('torchvision ok:', torchvision.__version__)" ; \
+    else \
+        echo "No torchvision wheel in ./spyre-inference/wheels/ — using base image system torchvision 0.25.0" ; \
+    fi && \
+    rm -rf /tmp/extra-wheels
+
+##############################################
+# Step 5 — bootstrap the uv-managed build tools listed in dev_install.md
+# (into the venv).
+##############################################
+RUN uv pip install --no-cache \
         "nanobind==2.9.2" ninja "pybind11==3.0.1" build "cmake~=3.26" regex wheel
 
 ##############################################
-# Step 6 — bring torch-spyre-docs into the image and generate a system-Python
-# variant of dev-env.sh (dev-env-system.sh) that does NOT source any venv and
-# points UV_PROJECT_ENVIRONMENT at /usr/local.
+# Step 6 — bring torch-spyre-docs into the image. dev-env.sh is used as-is:
+# it activates ${DTI_PROJECT_ROOT}/.venv (now that the venv exists) and sets
+# UV_PROJECT_ENVIRONMENT to it, so `uv sync --active` in build-torch-spyre.sh
+# resolves against the venv.
 ##############################################
 COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
 
-RUN sed -E \
-        -e 's|^source[[:space:]]+.*\.venv/bin/activate||' \
-        -e 's|^export[[:space:]]+UV_PROJECT_ENVIRONMENT=.*|export UV_PROJECT_ENVIRONMENT=/usr/local|' \
-        ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env.sh \
-    > ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env-system.sh && \
-    chmod +x ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env-system.sh
-
 ##############################################
 # Step 7 — SSH host keys + clone all required sources via BuildKit SSH mount.
-# checkout-required-src.sh prompts for github.user; we pass GITHUB_USER as
-# build arg. If not provided, fall back to --no-fork to clone torch-spyre
-# directly from upstream torch-spyre/torch-spyre.
+#
+# checkout-required-src.sh has a bug in the `--github-user` code path (an
+# unguarded `local` declaration at top level, which bash rejects with
+# "local: can only be used in a function"). Workaround: pre-set
+# `git config --global github.user`, then invoke the script WITHOUT
+# `--github-user`, so detect_github_user() picks the username from git
+# config and the working code branch runs. If GITHUB_USER build arg is
+# empty, fall back to --no-fork (clones torch-spyre from the upstream org).
 ##############################################
 RUN mkdir -p /root/.ssh && \
     ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
@@ -199,8 +256,9 @@ RUN mkdir -p /root/.ssh && \
 RUN --mount=type=ssh \
     cd ${DTI_PROJECT_ROOT} && \
     if [ -n "${GITHUB_USER}" ]; then \
+        git config --global github.user "${GITHUB_USER}" && \
         ./torch-spyre-docs/scripts/checkout-required-src.sh \
-            --non-interactive --github-user "${GITHUB_USER}" --update ; \
+            --non-interactive --update ; \
     else \
         ./torch-spyre-docs/scripts/checkout-required-src.sh \
             --non-interactive --no-fork --update ; \
@@ -209,33 +267,58 @@ RUN --mount=type=ssh \
 ##############################################
 # Step 8 — pin torch-spyre to the SHA in spyre-inference/pyproject.toml.
 # checkout-required-src.sh clones at main; we then check out the exact pin.
+# `--mount=type=ssh` is required because `git fetch` against the fork's
+# origin / upstream remotes uses SSH.
 ##############################################
-RUN cd ${DTI_PROJECT_ROOT}/torch-spyre && \
+RUN --mount=type=ssh \
+    cd ${DTI_PROJECT_ROOT}/torch-spyre && \
     git fetch --all --tags --prune && \
     git checkout ${TORCH_SPYRE_REF}
 
 ##############################################
-# Step 9 — build the AIU stack. LLVM must build first (it's outside the
-# build-everything.sh loop). build-everything.sh --tspyre then chains:
-# deeptools -> flex -> libaiupti -> torch_sendnn -> torch-spyre.
-#
-# Sourcing dev-env-system.sh in the same RUN keeps DTI_*/SENTIENT_* exports
-# live across all sub-scripts. The ccache cache mount accelerates re-runs.
+# Step 8b — pin flex to the commit compatible with TORCH_SPYRE_REF (see the
+# FLEX_REF ARG comment). checkout-required-src.sh leaves flex on main HEAD;
+# we reset it to FLEX_REF and re-init submodules (flex/common etc.) so
+# build-flex.sh compiles the matching API.
+##############################################
+RUN --mount=type=ssh \
+    cd ${DTI_PROJECT_ROOT}/flex && \
+    git fetch --all --tags --prune && \
+    git checkout ${FLEX_REF} && \
+    git submodule update --init --recursive
+
+##############################################
+# Step 9a — build LLVM (the long pole, ~40 min). Kept in its own layer so a
+# successful LLVM build is committed and cached: iterating on the steps below
+# won't recompile LLVM. ccache (configured above) makes even a cache-miss
+# rebuild fast after the first successful compile.
 ##############################################
 RUN --mount=type=cache,target=/root/.ccache \
     set -e && \
     cd ${DTI_PROJECT_ROOT} && \
-    . ./torch-spyre-docs/scripts/dev-env-system.sh && \
+    . ./torch-spyre-docs/scripts/dev-env.sh && \
     ./torch-spyre-docs/scripts/build-llvm-deeptools.sh && \
-    ./torch-spyre-docs/scripts/build-everything.sh --tspyre
+    ccache --show-stats || true
 
 ##############################################
-# Step 10 — smoke test. Must run with dev-env-system.sh sourced so
+# Step 9b — build the rest of the AIU stack. build-everything.sh --tspyre
+# chains: deeptools -> flex -> libaiupti -> torch_sendnn -> torch-spyre.
+# Separate layer so a failure here doesn't invalidate the cached LLVM layer.
+##############################################
+RUN --mount=type=cache,target=/root/.ccache \
+    set -e && \
+    cd ${DTI_PROJECT_ROOT} && \
+    . ./torch-spyre-docs/scripts/dev-env.sh && \
+    ./torch-spyre-docs/scripts/build-everything.sh --tspyre && \
+    ccache --show-stats || true
+
+##############################################
+# Step 10 — smoke test. Must run with dev-env.sh sourced so
 # LD_LIBRARY_PATH points at the rebuilt flex/deeptools/libaiupti.
 ##############################################
-RUN . ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env-system.sh && \
+RUN . ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env.sh && \
     python3 -c "import torch, torch_spyre, torch_sendnn; \
-                print('toolchain ok:', torch.__version__, torch_spyre.__file__, torch_sendnn.__version__)"
+                print('toolchain ok:', torch.__version__, 'torch_spyre@', torch_spyre.__file__)"
 
 RUN nm -D ${RUNTIME_INSTALL_DIR}/lib/libflex.so | \
         grep -E 'RuntimeOperationCompute|setPipelineBarrier' >/dev/null || \

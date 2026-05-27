@@ -4,12 +4,13 @@
 # Application image built on top of the spyre-toolchain image produced by
 # Dockerfile.base.s390x. Layers vllm + opencv + hf-xet + numactl + spyre-
 # inference on top, in a multi-stage build mirroring
-# aiu-inference-dev/Dockerfile.s390x but installing into system Python
-# (the spyre-granite-eval / toolchain image pattern, not /opt/vllm).
+# aiu-inference-dev/Dockerfile.s390x. Installs into the toolchain image's
+# uv venv at ${DTI_PROJECT_ROOT}/.venv (which already has torch 2.11,
+# torch_spyre, torch_sendnn) — NOT system Python.
 #
 # Stages:
 #   builder-base                — inherits envs from toolchain (VIRTUAL_ENV=
-#                                 /usr/local, UV_SYSTEM_PYTHON=1, ...)
+#                                 ${DTI_PROJECT_ROOT}/.venv, .venv/bin on PATH)
 #   numa-build                  — numactl 2.0.18 -> /opt/numactl
 #   rust                        — rustup stable for hf-xet build
 #   hf-xet-builder              — hf-xet 1.4.3 wheel
@@ -49,8 +50,10 @@ ARG SPYRE_INFERENCE_REF="main"
 ARG PYTHON_VERSION="3.12"
 
 ##############################################
-# builder-base — inherits everything from the toolchain image (system-Python
-# uv env, ${SENTIENT_BASE_INSTALL_DIR}, LD_LIBRARY_PATH, rust/openssl envs).
+# builder-base — inherits everything from the toolchain image: the active venv
+# (VIRTUAL_ENV=${DTI_PROJECT_ROOT}/.venv, .venv/bin on PATH), the sentient
+# install dirs, LD_LIBRARY_PATH, and the rust/openssl build envs. uv pip
+# install (no --system) therefore targets the venv.
 ##############################################
 FROM ${BASE_IMAGE} AS builder-base
 
@@ -58,7 +61,20 @@ ARG PYTHON_VERSION
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
 USER root
-SHELL ["/usr/bin/bash", "-lc"]
+# Non-login shell: avoids the base image's broken /etc/profile.d cp + podman
+# boot-id noise. The venv is already active via inherited VIRTUAL_ENV/PATH.
+SHELL ["/usr/bin/bash", "-c"]
+
+# Prepend the venv's torch libs so the vllm CPU build links against torch 2.11.
+ENV LD_LIBRARY_PATH=${DTI_PROJECT_ROOT}/.venv/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:${LD_LIBRARY_PATH}
+
+# vllm's requirements/build/cpu.txt adds `--extra-index-url <pytorch-cpu>` and
+# pins setuptools==77.0.3. uv prioritizes extra indexes with a first-index
+# strategy: it finds setuptools on the pytorch-cpu index (wrong version) and
+# won't fall back to PyPI for 77.0.3. unsafe-best-match makes uv consider all
+# versions across all (trusted) indexes — setuptools/cmake from PyPI, +cpu
+# wheels from pytorch-cpu. (torch is overridden to never-install anyway.)
+ENV UV_INDEX_STRATEGY=unsafe-best-match
 
 ##############################################
 # numa-build — produces /opt/numactl
@@ -106,7 +122,7 @@ ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=rust,source=/root/.cargo,target=/root/.cargo,rw \
     --mount=type=bind,from=rust,source=/root/.rustup,target=/root/.rustup,rw \
-    uv pip install --system --no-cache maturin patchelf && \
+    uv pip install --no-cache maturin patchelf && \
     git clone --branch v${HF_XET_VERSION} --depth 1 https://github.com/huggingface/xet-core.git && \
     cd xet-core/hf_xet/ && \
     python3 -m maturin build --release --out dist && \
@@ -124,7 +140,7 @@ WORKDIR /tmp
 ARG OPENCV_VERSION=88
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-cache numpy setuptools wheel scikit_build build && \
+    uv pip install --no-cache numpy setuptools wheel scikit_build build && \
     git clone --recursive https://github.com/opencv/opencv-python.git -b ${OPENCV_VERSION} && \
     cd opencv-python && \
     python3 -m build --wheel --installer=uv --outdir /tmp/opencv-python/dist
@@ -139,8 +155,26 @@ ENV CARGO_HOME=/root/.cargo
 ENV RUSTUP_HOME=/root/.rustup
 ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
 ENV CXXFLAGS="-Wno-bool-compare"
+# Cargo: use the sparse HTTP registry index instead of the legacy git index.
+# vllm pulls outlines-core (no s390x wheel -> built from Rust source via
+# maturin); the git-index cache from the rust stage goes stale and triggers
+# "failed to verify the checksum of <crate>". Sparse fetches the index fresh
+# over HTTP and sidesteps that. Retry/CLI git for flaky network.
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_NET_RETRY=5
+# vllm's CPU extension (csrc/cpu/utils.cpp) #includes <numa.h>. The base image
+# only ships numactl-libs (runtime libnuma.so.1), not the dev header. Bring in
+# the numactl we built in numa-build (/opt/numactl has include/numa.h + lib)
+# and put /usr/local/include on the compiler's search path.
+ENV C_INCLUDE_PATH="/usr/local/include:${C_INCLUDE_PATH:-}"
 
 WORKDIR /usr/src
+
+# numactl headers + libs for the vllm CPU compile (numa.h). No ldconfig needed
+# at build time — the compile finds numa.h via C_INCLUDE_PATH and links libnuma
+# via /usr/local/lib (also on LD_LIBRARY_PATH).
+COPY --from=numa-build /opt/numactl/. /usr/local/
 
 # overrides.txt: packages we either pre-provide (torch, torchvision,
 # torch-sendnn, torch-spyre from the toolchain image; pyarrow, opencv,
@@ -171,7 +205,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=rust,source=/root/.rustup,target=/root/.rustup,rw \
     --mount=type=bind,from=hf-xet-builder,source=/tmp/hf-xet/dist,target=/tmp/hf-xet-wheels/ \
     --mount=type=bind,from=opencv-builder,source=/tmp/opencv-python/dist,target=/tmp/opencv-wheels/ \
-    uv pip install --system --no-cache \
+    uv pip install --no-cache \
         $(ls /tmp/hf-xet-wheels/*.whl) \
         $(ls /tmp/opencv-wheels/*.whl)
 
@@ -183,14 +217,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/vllm-project/vllm.git /usr/src/vllm && \
     cd /usr/src/vllm && \
     git checkout tags/${VLLM_VERSION} && \
-    uv pip install --system --no-cache \
+    uv pip install --no-cache \
         --overrides /usr/src/overrides.txt \
-        -r requirements/cpu-build.txt && \
+        pip \
+        -r requirements/build/cpu.txt && \
     export CMAKE_PREFIX_PATH=$(python3 -m nanobind --cmake_dir):${CMAKE_PREFIX_PATH:-} && \
     mkdir -p /tmp/vllm-wheels && \
     VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 \
         pip wheel --no-build-isolation --no-deps -w /tmp/vllm-wheels/ . && \
-    uv pip install --system --no-cache \
+    uv pip install --no-cache \
         --overrides /usr/src/overrides.txt \
         /tmp/vllm-wheels/vllm-*.whl
 
@@ -219,15 +254,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         /usr/src/lock-pins.txt > /usr/src/lock-constraints.txt && \
     mkdir -p /tmp/spyre-wheels && \
     pip wheel --no-build-isolation --no-deps -w /tmp/spyre-wheels/ . && \
-    uv pip install --system --no-cache \
+    uv pip install --no-cache \
         --overrides /usr/src/overrides.txt \
         --constraint /usr/src/lock-constraints.txt \
         /tmp/spyre-wheels/spyre_inference-*.whl
 
 # Force pure-Python protobuf. The C++ extension crashes on big-endian
 # s390x; pairs with PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python in release.
-RUN find /usr/local/lib64/python${PYTHON_VERSION}/site-packages -name '_message*.so'          -path '*/google/protobuf/*' -delete && \
-    find /usr/local/lib64/python${PYTHON_VERSION}/site-packages -name '_api_implementation*.so' -path '*/google/protobuf/*' -delete
+RUN find ${DTI_PROJECT_ROOT}/.venv -name '_message*.so'          -path '*/google/protobuf/*' -delete && \
+    find ${DTI_PROJECT_ROOT}/.venv -name '_api_implementation*.so' -path '*/google/protobuf/*' -delete
 
 # Smoke test the assembled environment.
 RUN python3 -c "import torch, torch_spyre, torch_sendnn, vllm, spyre_inference; \
@@ -253,21 +288,41 @@ FROM runtime-base AS release
 
 ARG PYTHON_VERSION
 
-# Copy the built site-packages over the base. This is the system-Python
-# equivalent of `COPY --from=… /opt/vllm /opt/vllm` in aiu-inference-dev.
-COPY --from=spyre-inference-builder /usr/local/lib64/python${PYTHON_VERSION}/site-packages \
-                                    /usr/local/lib64/python${PYTHON_VERSION}/site-packages
-COPY --from=spyre-inference-builder /usr/local/bin /usr/local/bin
+# Overlay the venv from the builder (now with vllm + opencv + hf-xet +
+# spyre-inference added) over the toolchain image's venv. runtime-base is
+# FROM the toolchain image, so the sentient/ install dirs, /usr/local base
+# packages, and AIU RPM libs are already present — only the venv changed.
+# This is the venv equivalent of `COPY --from=… /opt/vllm /opt/vllm`.
+COPY --from=spyre-inference-builder ${DTI_PROJECT_ROOT}/.venv ${DTI_PROJECT_ROOT}/.venv
 
-# numactl static + dynamic libs.
+# numactl static + dynamic libs. ldconfig lives in /usr/sbin (not on the
+# venv-first PATH); full path + fallback so the runtime loader cache picks up
+# libnuma.so.1 (LD_LIBRARY_PATH also covers /usr/local/lib).
 COPY --from=numa-build /opt/numactl/. /usr/local/
-RUN ldconfig
+RUN /usr/sbin/ldconfig 2>/dev/null || /sbin/ldconfig 2>/dev/null || true
 
-# LD_LIBRARY_PATH ordering — our rebuilt flex/deeptools/libaiupti BEFORE the
-# base image's /opt/ibm/spyre/*/lib RPM versions. Non-login processes
-# (ENTRYPOINT) inherit this; login shells go through /etc/profile.d/
-# (zz-flex-overlay.sh below has the last word).
-ENV LD_LIBRARY_PATH="${SENTIENT_BASE_INSTALL_DIR}/runtime/lib:${SENTIENT_BASE_INSTALL_DIR}/deeptools/lib:${SENTIENT_BASE_INSTALL_DIR}/libaiupti/lib:${SENTIENT_BASE_INSTALL_DIR}/spyre_comms/lib:/usr/local/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/spyre-comms/lib:/usr/local/lib"
+# Capture the toolchain's overlay install dir under a dedicated name BEFORE we
+# repoint SENTIENT_BASE_INSTALL_DIR. The base image inherited
+# SENTIENT_BASE_INSTALL_DIR=${DTI_PROJECT_ROOT}/sentient (where the build
+# installed our rebuilt deeptools/flex/libaiupti/spyre_comms). But the base's
+# /etc/profile.d/ibm-aiu-setup.sh reuses SENTIENT_BASE_INSTALL_DIR at runtime to
+# locate its AIU discovery scripts (aiu-discover-topo, aiu-assign-ranks.py) and
+# senlib — all of which live at /opt/ibm/spyre. If it points at our overlay dir,
+# discovery bails ("Missing .../aiu-assign-ranks.py"), the autogen senlib config
+# is never produced, and the container can't open the AIU. So: keep the overlay
+# path in SPYRE_OVERLAY_DIR, and repoint SENTIENT_BASE_INSTALL_DIR=/opt/ibm/spyre.
+ENV SPYRE_OVERLAY_DIR=${SENTIENT_BASE_INSTALL_DIR}
+
+# LD_LIBRARY_PATH ordering — our rebuilt flex/deeptools/libaiupti/spyre_comms
+# (SPYRE_OVERLAY_DIR) BEFORE the base image's /opt/ibm/spyre/*/lib RPM versions,
+# then the venv's torch libs. Non-login processes (ENTRYPOINT) inherit this;
+# login shells go through /etc/profile.d/ (zz-flex-overlay.sh below re-prepends
+# the overlay after ibm-aiu-setup.sh demotes it).
+ENV LD_LIBRARY_PATH="${SPYRE_OVERLAY_DIR}/runtime/lib:${SPYRE_OVERLAY_DIR}/deeptools/lib:${SPYRE_OVERLAY_DIR}/libaiupti/lib:${SPYRE_OVERLAY_DIR}/spyre_comms/lib:${DTI_PROJECT_ROOT}/.venv/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/spyre-comms/lib:/usr/local/lib"
+
+# Repoint SENTIENT_BASE_INSTALL_DIR at the base RPM tree so ibm-aiu-setup.sh
+# finds aiu-discover-topo / aiu-assign-ranks.py / senlib at runtime.
+ENV SENTIENT_BASE_INSTALL_DIR=/opt/ibm/spyre
 
 # Defense-in-depth profile.d scripts. The base image's
 # /etc/profile.d/ibm-aiu-setup.sh runs on login shells and re-prepends
@@ -295,12 +350,34 @@ ENV DTLOG_COLOR=0 \
 COPY ./container-scripts /home/senuser/container-scripts
 RUN chmod +x /home/senuser/container-scripts/*.sh || true
 
-RUN mkdir -p /home/senuser/.cache && \
-    chmod -R g+rwx /home/ && \
-    chown -R senuser:0 /home/
+# Create the senuser account (UID 1234, GID 0). The base image ships no senuser,
+# so pwd.getpwuid(1234) KeyErrors — torch's default_cache_dir() (via
+# getpass.getuser()) and other libs look up the username at runtime and crash.
+# Also create writable /home/senuser and /etc/aiu: ibm-aiu-setup.sh copies the
+# autogen senlib config to /etc/aiu/senlib_config.json and ${HOME}/.senlib.json,
+# and as the non-root senuser (gid 0) needs both writable. No pre-existing
+# root-owned senlib_config.json may remain or the overwrite is denied.
+RUN (getent passwd senuser >/dev/null || \
+        useradd -u 1234 -g 0 -m -d /home/senuser -s /bin/bash senuser) 2>/dev/null || true; \
+    grep -q '^senuser:' /etc/passwd || \
+        echo 'senuser:x:1234:0:senuser:/home/senuser:/bin/bash' >> /etc/passwd; \
+    rm -f /etc/aiu/senlib_config.json; \
+    mkdir -p /home/senuser/.cache /etc/aiu && \
+    chown -R 1234:0 /home/senuser /etc/aiu && \
+    chmod -R g+rwX /home/senuser /etc/aiu
 
+# PATH: overlay bin dirs FIRST (the rebuilt dxp_standalone kernel-bundler must
+# match the overlay libs on LD_LIBRARY_PATH — mixing the base /opt/ibm/spyre
+# dxp_standalone binary with our overlay libs aborts with std::out_of_range
+# (map::at) during AIU graph compilation), then the venv bin so `python3`/`vllm`
+# resolve to the venv interpreter (torch 2.11, torch_spyre, vllm, spyre_inference).
+# USER/LOGNAME: torch's default_cache_dir() calls getpass.getuser(); these are
+# belt-and-braces alongside the senuser passwd entry created above so the
+# username always resolves.
 ENV HOME=/home/senuser \
-    PATH=/home/senuser/.local/bin:/usr/local/bin:/usr/bin:/bin
+    USER=senuser \
+    LOGNAME=senuser \
+    PATH=/home/senuser/.local/bin:${SPYRE_OVERLAY_DIR}/runtime/bin:${SPYRE_OVERLAY_DIR}/deeptools/bin:${SPYRE_OVERLAY_DIR}/libaiupti/bin:${SPYRE_OVERLAY_DIR}/spyre_comms/bin:${DTI_PROJECT_ROOT}/.venv/bin:/usr/local/bin:/usr/bin:/bin
 
 WORKDIR ${HOME}
 
@@ -329,7 +406,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=spyre-inference-builder,source=/usr/src/spyre-inference,target=/usr/src/spyre-inference \
     cd /usr/src/spyre-inference && \
     uv pip compile --group dev --no-deps > /tmp/requirements-test.txt && \
-    uv pip install --system --no-cache -r /tmp/requirements-test.txt
+    uv pip install --no-cache -r /tmp/requirements-test.txt
 
 USER 1234:0
 WORKDIR ${HOME}
