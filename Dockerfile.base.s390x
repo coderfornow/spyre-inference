@@ -8,13 +8,18 @@
 #
 # Why this image exists:
 #   - The base spyre-granite-eval image ships torch_spyre as a broken editable
-#     install shim (finder points at a deleted /workspace/torch-spyre) and
-#     libflex.so at commit d19074e5 (missing 3-arg RuntimeOperationCompute /
-#     setPipelineBarrier symbols needed by newer torch-spyre).
-#   - The base image is also built against torch 2.10.0+cpu but the upstream
-#     torch-spyre / torch-sendnn branches have been updated for torch 2.11.0+cpu.
-#     We install torch 2.11.0+cpu from the pytorch-cpu index (which publishes
-#     manylinux2014_s390x wheels) into the venv before rebuilding.
+#     install shim (finder points at a deleted /workspace/torch-spyre) and a
+#     libflex.so that lags the torch-spyre/flex `main` HEADs this image rebuilds
+#     against, so we recompile the AIU stack from source on top of the base.
+#   - The base image may also lag torch 2.11.0+cpu. We install torch 2.11.0+cpu
+#     from the pytorch-cpu index (which publishes manylinux2014_s390x wheels)
+#     into the venv before rebuilding; if the base already ships 2.11 the venv
+#     copy simply shadows it.
+#
+# VF-via-streams: this image pins the base nightly nightly-2026_05_31-030056 and
+# rebuilds torch-spyre + flex from their `main` branches, which carry the
+# stream-based VF (SR-IOV virtual function) execution support. See the
+# TORCH_SPYRE_REF / FLEX_REF ARGs below.
 #
 # Python environment:
 #   torch-spyre-docs scripts (dev-env.sh, build-torch-spyre.sh) require an
@@ -29,7 +34,7 @@
 #   cd /Users/ritikdhiranan/PycharmProjects
 #   podman build --ssh default=$SSH_AUTH_SOCK \
 #       --build-arg GITHUB_USER=$(git config --get github.user) \
-#       --build-arg NIGHTLY_DATE=latest \
+#       --build-arg NIGHTLY_DATE=nightly-2026_05_31-030056 \
 #       -f spyre-inference/Dockerfile.base.s390x \
 #       -t localhost/spyre-toolchain:s390x \
 #       .
@@ -38,23 +43,20 @@
 # torch-spyre-docs/ so the COPY ./torch-spyre-docs line resolves.
 ##############################################
 
-ARG NIGHTLY_DATE="latest"
+ARG NIGHTLY_DATE="nightly-2026_05_31-030056"
 ARG BASE_IMAGE="icr.io/ocp-ai-on-z/spyre-granite-eval:${NIGHTLY_DATE}"
 
 FROM ${BASE_IMAGE} AS toolchain
 
 ARG GITHUB_USER
 ARG TORCH_VERSION="2.11.0"
-# torch-spyre pin from spyre-inference/pyproject.toml:96
-ARG TORCH_SPYRE_REF="539a1a0c2d54b228c19c982ee80044e210bcde98"
-# flex pin compatible with TORCH_SPYRE_REF. checkout-required-src.sh clones
-# flex@main HEAD, which has moved ahead and removed the default value from
-# FlexAllocator::allocate(size_t, const AllocationDirective&) — torch-spyre
-# 539a1a0c (2026-05-11) calls the single-arg allocate(nbytes), so it needs a
-# flex where that default still exists. fbbcb975 is the last flex main commit
-# on/before torch-spyre 539a1a0c's date (2026-05-08), i.e. the flex HEAD that
-# 539a1a0c was developed against.
-ARG FLEX_REF="fbbcb9757be8966960ff28cc5b56d3f6e4f8e17e"
+# Track `main` for torch-spyre and flex — the same branches checkout-required-src.sh
+# clones — because the stream-based VF (virtual function) execution support landed
+# on main after the old fixed pins (539a1a0c / fbbcb975, dated 2026-05-08/11) and is
+# not present in them. main+main are co-developed and mutually compatible. Override
+# with a SHA only as a fallback if a future main pair regresses the build.
+ARG TORCH_SPYRE_REF="main"
+ARG FLEX_REF="main"
 # LLVM pin from torch-spyre-docs/scripts/checkout-required-src.sh:876
 ARG LLVM_COMMIT="dd6f6a096a59892ce1f9c454461aa5ed4c2aa971"
 ARG PYTHON_VERSION="3.12"
@@ -265,8 +267,9 @@ RUN --mount=type=ssh \
     fi
 
 ##############################################
-# Step 8 — pin torch-spyre to the SHA in spyre-inference/pyproject.toml.
-# checkout-required-src.sh clones at main; we then check out the exact pin.
+# Step 8 — check out torch-spyre at TORCH_SPYRE_REF (default `main`).
+# checkout-required-src.sh already leaves it on main; this re-fetches and
+# checks out the ref so a SHA override (fallback) also works.
 # `--mount=type=ssh` is required because `git fetch` against the fork's
 # origin / upstream remotes uses SSH.
 ##############################################
@@ -276,10 +279,10 @@ RUN --mount=type=ssh \
     git checkout ${TORCH_SPYRE_REF}
 
 ##############################################
-# Step 8b — pin flex to the commit compatible with TORCH_SPYRE_REF (see the
-# FLEX_REF ARG comment). checkout-required-src.sh leaves flex on main HEAD;
-# we reset it to FLEX_REF and re-init submodules (flex/common etc.) so
-# build-flex.sh compiles the matching API.
+# Step 8b — check out flex at FLEX_REF (default `main`, matching torch-spyre).
+# checkout-required-src.sh leaves flex on main HEAD; we re-fetch, check out the
+# ref, and re-init submodules (flex/common etc.) so build-flex.sh compiles the
+# matching API.
 ##############################################
 RUN --mount=type=ssh \
     cd ${DTI_PROJECT_ROOT}/flex && \
@@ -323,6 +326,26 @@ RUN . ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env.sh && \
 RUN nm -D ${RUNTIME_INSTALL_DIR}/lib/libflex.so | \
         grep -E 'RuntimeOperationCompute|setPipelineBarrier' >/dev/null || \
     { echo "ERROR: ${RUNTIME_INSTALL_DIR}/lib/libflex.so missing required symbols"; exit 1; }
+
+##############################################
+# Step 10b — reconcile the flex runtime to a SINGLE const-ABI copy.
+#
+# The base image (spyre-granite-eval) ships a STALE flex at
+# /opt/ibm/spyre/runtime/lib/libflex.so (commit d19074e5) that exports the
+# NON-const setPipelineBarrier(bool) overload. The overlay flex we just built
+# (${RUNTIME_INSTALL_DIR}/lib) exports the CONST overload that torch_spyre/_C.so
+# links against. The base /etc/profile.d/ibm-aiu-setup.sh prepends
+# /opt/ibm/spyre/*/lib to LD_LIBRARY_PATH on login shells, so the stale build
+# can shadow ours -> `undefined symbol: _ZNK…setPipelineBarrierEb` at import.
+#
+# reconcile-flex-runtime.sh DELETES every libflex.so* that is not the overlay
+# build (leaving senlib / flightlog / deeptools / discovery scripts intact),
+# then guards that exactly one const-ABI libflex remains. Removing it here, in
+# the toolchain image, means the app image inherits an already-clean tree.
+##############################################
+COPY ./spyre-inference/container-scripts/reconcile-flex-runtime.sh /usr/local/bin/reconcile-flex-runtime.sh
+RUN chmod +x /usr/local/bin/reconcile-flex-runtime.sh && \
+    SPYRE_OVERLAY_DIR=${SENTIENT_BASE_INSTALL_DIR} /usr/local/bin/reconcile-flex-runtime.sh
 
 ##############################################
 # Step 11 — slim the layer. Drop cmake build trees and the giant LLVM source

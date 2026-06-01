@@ -324,16 +324,38 @@ ENV LD_LIBRARY_PATH="${SPYRE_OVERLAY_DIR}/runtime/lib:${SPYRE_OVERLAY_DIR}/deept
 # finds aiu-discover-topo / aiu-assign-ranks.py / senlib at runtime.
 ENV SENTIENT_BASE_INSTALL_DIR=/opt/ibm/spyre
 
+# Reconcile the flex runtime to a SINGLE const-ABI copy. The toolchain image
+# already ran this (Dockerfile.base.s390x step 10b), so on a clean base this is
+# a fast no-op guard; we re-run it here so the app image is correct even when
+# built on a base that predates the reconcile. It physically deletes the stale
+# /opt/ibm/spyre/runtime/lib/libflex.so (NON-const setPipelineBarrier) that the
+# base image ships, leaving the overlay's const-ABI libflex as the only copy on
+# the system. With one libflex, no LD_LIBRARY_PATH ordering can reintroduce the
+# `undefined symbol: _ZNK…setPipelineBarrierEb` import failure. Fails the build
+# if more than one libflex remains or it lacks the const symbol. Keys off
+# SPYRE_OVERLAY_DIR (set above). senlib / discovery scripts are left untouched.
+COPY ./container-scripts/reconcile-flex-runtime.sh /usr/local/bin/reconcile-flex-runtime.sh
+RUN chmod +x /usr/local/bin/reconcile-flex-runtime.sh && \
+    /usr/local/bin/reconcile-flex-runtime.sh
+
 # Defense-in-depth profile.d scripts. The base image's
 # /etc/profile.d/ibm-aiu-setup.sh runs on login shells and re-prepends
 # /opt/ibm/spyre/*/lib to LD_LIBRARY_PATH (demoting our overlay). The
 # zz- prefix sorts alphabetically AFTER ibm-aiu-setup.sh so these win.
+# NB: flex shadowing is already structurally impossible after the reconcile
+# above (only one libflex exists); zz-flex-overlay.sh still matters for PATH
+# (dxp_standalone kernel bundler) and the non-flex overlay libs.
 COPY ./container-scripts/zz-flex-overlay.sh    /etc/profile.d/zz-flex-overlay.sh
 COPY ./container-scripts/zz-aiu-single-card.sh /etc/profile.d/zz-aiu-single-card.sh
 RUN chmod 0644 /etc/profile.d/zz-flex-overlay.sh /etc/profile.d/zz-aiu-single-card.sh
 
 # Environment for spyre-inference + vllm runtime.
 # FLEX_DEVICE=PF — spyre-inference only supports PF; VF is not implemented.
+# VLLM_ATTENTION_BACKEND=CUSTOM — force the plugin's Spyre attention backend.
+# Without this, vLLM auto-selects its default CPU backend (TORCH_SDPA), which
+# produces GARBAGE output in float16 (it is only numerically stable in
+# bfloat16). The plugin's CUSTOM Spyre attention is correct in float16; this
+# env makes the server (and the offline example) use it by default.
 ENV DTLOG_COLOR=0 \
     DTLOG_LEVEL=error \
     DT_DEEPRT_VERBOSE="-1" \
@@ -342,6 +364,7 @@ ENV DTLOG_COLOR=0 \
     TOKENIZERS_PARALLELISM=false \
     TORCH_SENDNN_LOG=CRITICAL \
     VLLM_PLUGINS=spyre_inference \
+    VLLM_ATTENTION_BACKEND=CUSTOM \
     FLEX_DEVICE=PF \
     FLEX_COMPUTE=SENTIENT \
     PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
@@ -365,6 +388,19 @@ RUN (getent passwd senuser >/dev/null || \
     mkdir -p /home/senuser/.cache /etc/aiu && \
     chown -R 1234:0 /home/senuser /etc/aiu && \
     chmod -R g+rwX /home/senuser /etc/aiu
+
+# Remove AIU discovery caches baked into the base image. spyre-granite-eval was
+# snapshotted on a multi-AIU host, so /tmp/etc/ibm/spyre/topo.json (and possibly
+# /etc/ibm/spyre/topo.json) list all 4 cards. ibm-aiu-setup.sh then trusts that
+# cache ("Using cache", "Found: 4") instead of discovering this container's
+# devices, and senlib tries to open every listed card — failing on
+# /dev/vfio/<n> not passed via --device (RAS 0x332b DeviceOpenFail). With the
+# caches gone, discovery runs fresh at startup and only sees the AIUs actually
+# mapped in. This also drops the root-owned /tmp/etc whose chmod the non-root
+# entrypoint can't change.
+RUN rm -rf /tmp/etc \
+           /etc/ibm/spyre/topo.json \
+           /etc/ibm/spyre/senlib_config.json 2>/dev/null || true
 
 # PATH: overlay bin dirs FIRST (the rebuilt dxp_standalone kernel-bundler must
 # match the overlay libs on LD_LIBRARY_PATH — mixing the base /opt/ibm/spyre

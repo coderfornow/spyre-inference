@@ -6,8 +6,11 @@
 # re-prepends our rebuilt flex/deeptools/libaiupti/spyre-comms from the
 # torch-spyre-docs build pipeline so they win at dynamic-link AND exec time:
 #
-#   - LD_LIBRARY_PATH: without this, libflex.so resolves to the older base RPM
-#     build (d19074e5) which lacks the symbols torch_spyre was compiled against.
+#   - LD_LIBRARY_PATH: keeps the overlay runtime/deeptools/libaiupti/spyre-comms
+#     libs first. NB: the stale base-RPM libflex.so (d19074e5, NON-const
+#     setPipelineBarrier) is physically removed at build time by
+#     reconcile-flex-runtime.sh, so flex can no longer be shadowed regardless of
+#     ordering; this prepend now matters for the OTHER overlay libs.
 #   - PATH: without this, dxp_standalone (the kernel bundler invoked during AIU
 #     graph compilation) resolves to the base RPM binary while our overlay libs
 #     are on LD_LIBRARY_PATH — that binary/lib mismatch aborts with
