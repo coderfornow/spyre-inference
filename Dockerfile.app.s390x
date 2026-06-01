@@ -40,8 +40,9 @@
 #       -e VLLM_MODEL_PATH=/path/to/model \
 #       --entrypoint /bin/bash localhost/spyre-inference:s390x -l
 #
-# NB: spyre-inference currently supports PF (Physical Function) only; VF
-# is not implemented. FLEX_DEVICE defaults to PF below.
+# NB: VF (Virtual Function) execution is supported via the runtime's stream
+# support (torch-spyre/flex main). FLEX_DEVICE defaults to PF below; set
+# FLEX_DEVICE=VF to run on a VF.
 ##############################################
 
 ARG BASE_IMAGE="localhost/spyre-toolchain:s390x"
@@ -350,7 +351,8 @@ COPY ./container-scripts/zz-aiu-single-card.sh /etc/profile.d/zz-aiu-single-card
 RUN chmod 0644 /etc/profile.d/zz-flex-overlay.sh /etc/profile.d/zz-aiu-single-card.sh
 
 # Environment for spyre-inference + vllm runtime.
-# FLEX_DEVICE=PF — spyre-inference only supports PF; VF is not implemented.
+# FLEX_DEVICE=PF — default; VF is also supported (run with -e FLEX_DEVICE=VF),
+# backed by the runtime stream support in torch-spyre/flex main.
 # VLLM_ATTENTION_BACKEND=CUSTOM — force the plugin's Spyre attention backend.
 # Without this, vLLM auto-selects its default CPU backend (TORCH_SDPA), which
 # produces GARBAGE output in float16 (it is only numerically stable in
@@ -438,11 +440,20 @@ USER root
 RUN dnf install -y nano sudo vim && \
     dnf clean all
 
+# Lean test deps for the Spyre device/layer tests. The dev group's
+# spyre-testing-plugin (tests/plugin) hard-pins the full upstream vLLM test
+# stack (bitsandbytes, librosa/numba/llvmlite, av, mteb, gpt-oss, …), almost
+# none of which has an s390x wheel — they back upstream multimodal suites we
+# don't run here. So instead of compiling the whole dev group, install just
+# pytest + pyyaml and the plugin itself with --no-deps (which still registers
+# its pytest11 entrypoint + fixtures). The Spyre layer tests (test_rms_norm,
+# test_mlp, test_silu_and_mul, test_parallel_lm_head, test_spyre_attn) need
+# nothing more.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=spyre-inference-builder,source=/usr/src/spyre-inference,target=/usr/src/spyre-inference,rw \
     cd /usr/src/spyre-inference && \
-    uv pip compile --group dev --no-deps > /tmp/requirements-test.txt && \
-    uv pip install --no-cache -r /tmp/requirements-test.txt
+    uv pip install --no-cache pytest pyyaml && \
+    uv pip install --no-cache --no-deps /usr/src/spyre-inference/tests/plugin
 
 USER 1234:0
 WORKDIR ${HOME}
