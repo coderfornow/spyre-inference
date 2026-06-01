@@ -439,7 +439,7 @@ RUN dnf install -y nano sudo vim && \
     dnf clean all
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,from=spyre-inference-builder,source=/usr/src/spyre-inference,target=/usr/src/spyre-inference \
+    --mount=type=bind,from=spyre-inference-builder,source=/usr/src/spyre-inference,target=/usr/src/spyre-inference,rw \
     cd /usr/src/spyre-inference && \
     uv pip compile --group dev --no-deps > /tmp/requirements-test.txt && \
     uv pip install --no-cache -r /tmp/requirements-test.txt
