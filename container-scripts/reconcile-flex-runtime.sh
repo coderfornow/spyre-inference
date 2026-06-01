@@ -40,6 +40,18 @@ CONST_SYM='setPipelineBarrier(bool) const'
 log()  { printf '[reconcile-flex] %s\n' "$*"; }
 die()  { printf '[reconcile-flex] FATAL: %s\n' "$*" >&2; exit 1; }
 
+# Does $1 (.so) export the const setPipelineBarrier overload?
+# NOTE: do NOT inline this as `nm ... | grep -q ...`. Under `set -o pipefail`,
+# `grep -q` exits on first match and closes the pipe; `nm` then dies with
+# SIGPIPE (141), and pipefail reports the pipeline as failed even though the
+# symbol IS present — a false negative. Capture nm's output first, then grep a
+# here-string (no pipe, no SIGPIPE).
+flex_exports_const() {
+  local out
+  out="$(nm -DC "$1" 2>/dev/null || true)"
+  grep -qF "${CONST_SYM}" <<<"${out}"
+}
+
 command -v nm   >/dev/null 2>&1 || die "nm not found (binutils required)"
 command -v find >/dev/null 2>&1 || die "find not found"
 
@@ -51,7 +63,7 @@ find_flex() {
 # 1. The overlay flex must exist and export the CONST setPipelineBarrier symbol
 #    that torch_spyre/_C.so was compiled against.
 [ -e "${CANON}" ] || die "overlay flex not found at ${CANON}"
-if ! nm -DC "${CANON}" 2>/dev/null | grep -qF "${CONST_SYM}"; then
+if ! flex_exports_const "${CANON}"; then
   log "setPipelineBarrier symbols present in ${CANON}:"
   nm -DC "${CANON}" 2>/dev/null | grep -i setpipelinebarrier >&2 || true
   die "overlay flex ${CANON} does not export the const '${CONST_SYM}'"
@@ -81,7 +93,7 @@ if [ "${#survivors[@]}" -ne 1 ]; then
   printf '  %s\n' "${survivors[@]}" >&2
   die "expected exactly 1 libflex.so after reconcile, found ${#survivors[@]}"
 fi
-nm -DC "${survivors[0]}" 2>/dev/null | grep -qF "${CONST_SYM}" \
+flex_exports_const "${survivors[0]}" \
   || die "surviving flex ${survivors[0]} lacks the const '${CONST_SYM}'"
 
 # 4. Best-effort: if torch_spyre is importable in this stage, confirm _C.so has

@@ -33,12 +33,20 @@
 # Build:
 #   eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519_gh ~/.ssh/id_ed25519_ghe
 #   cd /Users/ritikdhiranan/PycharmProjects
-#   podman build --ssh default=$SSH_AUTH_SOCK \
+#   podman build --format docker \
+#       --security-opt seccomp=unconfined --security-opt label=disable \
+#       --ssh default=$SSH_AUTH_SOCK \
 #       --build-arg GITHUB_USER=$(git config --get github.user) \
 #       --build-arg NIGHTLY_DATE=latest \
 #       -f spyre-inference/Dockerfile.base.s390x \
 #       -t localhost/spyre-toolchain:s390x \
 #       .
+#
+#   --format docker         : honor the SHELL directive below (OCI format ignores it).
+#   --security-opt seccomp=unconfined --security-opt label=disable :
+#       s390x build hosts otherwise block glibc's RELRO mprotect with
+#       "cannot apply additional memory protection after relocation:
+#       Permission denied" in the first RUN. Same flags the app-image build uses.
 #
 # Build context note: must be the parent of both spyre-inference/ and
 # torch-spyre-docs/ so the COPY ./torch-spyre-docs line resolves.
