@@ -19,12 +19,22 @@ source /etc/profile.d/ibm-aiu-setup.sh || true
 
 # VF (Virtual Function) execution is supported via the runtime's stream support
 # (torch-spyre/flex main, ~2026-05-31 nightly toolchain — rebuilt into the base
-# image). Select it with FLEX_DEVICE=VF (PF remains the default). The senlib
-# config tweak below disables RISC-V emulation and is only required for VF —
-# skip it under PF.
+# image). Select it with FLEX_DEVICE=VF (PF remains the default).
+#
+# senlib 2.0.0 RELOCATED the DOOM/RISC-V knob to top-level `GENERAL.doom`
+# (it used to live under `SNT_MCI.DCR.MCI_CTRL.*`). On the new stack VF devices
+# REQUIRE DOOM mode ENABLED — starting a VF with DOOM disabled fails hard with
+# `RAS::CONFIGURATION::InvalidDeviceForDOOMMode` (0xf72e). This is the OPPOSITE
+# of the old PF multi-card path, which disabled RISC-V. The autogen config
+# already sets `GENERAL.doom=true`; we write it through explicitly so the
+# requirement is self-documenting and robust to autogen changes.
+#
+# NB: the previous tweak here (`.SNT_MCI.DCR.MCI_CTRL.ENABLE_RISCV=0x0 | ...`)
+# was carried over from the pre-2.0.0 senlib schema. Those keys no longer exist
+# in 2.0.0, so the jq only created a dead `SNT_MCI` branch and never touched the
+# real DOOM setting — it was a no-op at best. Do NOT reintroduce it for VF.
 if [ "${FLEX_DEVICE:-PF}" = "VF" ]; then
-  jq '(.SNT_MCI.DCR.MCI_CTRL.ENABLE_RISCV = "0x0") | del(.SNT_MCI.init) | (.METRICS.general.enable = true)' \
-      "${AIU_AUTOGEN_SENLIB_CONFIG_FILE}" > "$HOME/.senlib.json"
+  jq '.GENERAL.doom = true' "${AIU_AUTOGEN_SENLIB_CONFIG_FILE}" > "$HOME/.senlib.json"
 fi
 
 # Enable gcc-toolset-14 if present (provides matching libstdc++/libgcc on
