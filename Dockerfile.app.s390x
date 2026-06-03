@@ -1,12 +1,16 @@
 ##############################################
 # Dockerfile.app.s390x
 #
-# Application image built on top of the spyre-toolchain image produced by
-# Dockerfile.base.s390x. Layers vllm + opencv + hf-xet + numactl + spyre-
-# inference on top, in a multi-stage build mirroring
-# aiu-inference-dev/Dockerfile.s390x. Installs into the toolchain image's
-# uv venv at ${DTI_PROJECT_ROOT}/.venv (which already has torch 2.11,
-# torch_spyre, torch_sendnn) — NOT system Python.
+# Application image built on top of the spyre-toolchain image. That toolchain is
+# produced by EITHER Dockerfile-torch-spyre.s390x (current: on the 2.0
+# spyre-runtime-dev base, VF-compute flex) or the older Dockerfile.base.s390x
+# (granite-eval). Layers vllm + opencv + hf-xet + numactl + spyre-inference on
+# top, in a multi-stage build mirroring aiu-inference-dev/Dockerfile.s390x.
+# Installs into the toolchain image's uv venv at ${DTI_PROJECT_ROOT}/.venv, which
+# has torch 2.11 + torch_spyre and — via --system-site-packages — inherits
+# torch_sendnn / torchvision / PIL from the base image's system site-packages.
+# This Dockerfile is written in terms of inherited env (${DTI_PROJECT_ROOT},
+# ${SENTIENT_BASE_INSTALL_DIR}, …), so it works unchanged on either toolchain.
 #
 # Stages:
 #   builder-base                — inherits envs from toolchain (VIRTUAL_ENV=
@@ -21,9 +25,9 @@
 #   release                     — final image, USER 1234:0, EXPOSE 8000
 #   dev                         — adds nano/sudo + test deps
 #
-# Build (after building Dockerfile.base.s390x as localhost/spyre-toolchain:s390x):
+# Build (after building Dockerfile.base.s390x as icr.io/ocp-ai-on-z/aiu-dev/spyre-toolchain:s390x):
 #   podman build \
-#       --build-arg BASE_IMAGE=localhost/spyre-toolchain:s390x \
+#       --build-arg BASE_IMAGE=icr.io/ocp-ai-on-z/aiu-dev/spyre-toolchain:s390x \
 #       --build-arg VLLM_VERSION=v0.20.1 \
 #       -f Dockerfile.app.s390x \
 #       --target release \
@@ -45,7 +49,7 @@
 # FLEX_DEVICE=VF to run on a VF.
 ##############################################
 
-ARG BASE_IMAGE="localhost/spyre-toolchain:s390x"
+ARG BASE_IMAGE="icr.io/ocp-ai-on-z/aiu-dev/spyre-toolchain:s390x"
 ARG VLLM_VERSION="v0.20.1"
 ARG SPYRE_INFERENCE_REF="main"
 ARG PYTHON_VERSION="3.12"
@@ -281,9 +285,12 @@ ARG PYTHON_VERSION
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
 ##############################################
-# release — final image for serving. Copies the assembled system-Python
-# site-packages from spyre-inference-builder over the toolchain's, drops
-# numactl, sets LD_LIBRARY_PATH, ENV, profile.d defenses, ENTRYPOINT.
+# release — final image for serving. Copies the assembled uv venv (now with
+# vllm + opencv + hf-xet + spyre-inference added) from spyre-inference-builder
+# over the toolchain's; the base's system site-packages (torch_sendnn /
+# torchvision / PIL) are inherited via runtime-base (FROM the toolchain) and seen
+# through the venv's --system-site-packages. Drops numactl, sets LD_LIBRARY_PATH,
+# ENV, profile.d defenses, ENTRYPOINT.
 ##############################################
 FROM runtime-base AS release
 
@@ -391,15 +398,16 @@ RUN (getent passwd senuser >/dev/null || \
     chown -R 1234:0 /home/senuser /etc/aiu && \
     chmod -R g+rwX /home/senuser /etc/aiu
 
-# Remove AIU discovery caches baked into the base image. spyre-granite-eval was
-# snapshotted on a multi-AIU host, so /tmp/etc/ibm/spyre/topo.json (and possibly
-# /etc/ibm/spyre/topo.json) list all 4 cards. ibm-aiu-setup.sh then trusts that
-# cache ("Using cache", "Found: 4") instead of discovering this container's
-# devices, and senlib tries to open every listed card — failing on
-# /dev/vfio/<n> not passed via --device (RAS 0x332b DeviceOpenFail). With the
+# Remove AIU discovery caches baked into the base image. If the base was
+# snapshotted on a multi-AIU host, /tmp/etc/ibm/spyre/topo.json (and possibly
+# /etc/ibm/spyre/topo.json) can list cards not mapped into this container.
+# ibm-aiu-setup.sh then trusts that cache ("Using cache") instead of discovering
+# this container's devices, and senlib tries to open every listed card — failing
+# on /dev/vfio/<n> not passed via --device (RAS 0x332b DeviceOpenFail). With the
 # caches gone, discovery runs fresh at startup and only sees the AIUs actually
 # mapped in. This also drops the root-owned /tmp/etc whose chmod the non-root
-# entrypoint can't change.
+# entrypoint can't change — important since the toolchain builds as root and the
+# spyre-runtime-dev base also pre-creates /tmp/etc.
 RUN rm -rf /tmp/etc \
            /etc/ibm/spyre/topo.json \
            /etc/ibm/spyre/senlib_config.json 2>/dev/null || true
