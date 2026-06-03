@@ -221,6 +221,16 @@ RUN uv pip install --no-cache \
 # it doesn't drag torch off PyPI). If none provided, fall back to the base
 # image's system torchvision.
 ##############################################
+# Pillow (PIL): torchvision is installed --no-deps below and imports PIL at
+# import time (and transformers imports torchvision eagerly). The granite-eval
+# base shipped Pillow in system site-packages; the lean 2.0 base does NOT, and
+# Pillow has NO s390x wheel on PyPI. The base IS subscribed and already has EPEL
+# enabled, so install the prebuilt python3-pillow RPM — it lands in the system
+# site-packages our --system-site-packages venv inherits (same as granite-eval).
+# Verified on RHEL 10.2/s390x: `dnf install python3-pillow` resolves cleanly
+# (python3-pillow 11.0.0-1.el10_0 from epel + 18 deps from AppStream/BaseOS/epel).
+RUN dnf install -y python3-pillow && dnf clean all
+
 COPY ./spyre-inference/wheels/ /tmp/extra-wheels/
 RUN VENV_SP=${DTI_PROJECT_ROOT}/.venv/lib64/python${PYTHON_VERSION}/site-packages && \
     rm -rf "${VENV_SP}/torchvision" "${VENV_SP}"/torchvision-*.dist-info && \
