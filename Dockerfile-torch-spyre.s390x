@@ -1,0 +1,342 @@
+##############################################
+# Dockerfile-torch-spyre.s390x
+#
+# Toolchain image: a LEAN variant of Dockerfile.base.s390x that builds on the
+# 2.0 prebuilt base (icr.io/ai_sw_accel/2.0/spyre-backend) instead of
+# spyre-granite-eval. That base already ships the ENTIRE native AIU stack under
+# /opt/ibm/spyre (deeptools, flex w/ VF-streams, senlib-dd2 w/ libVF, sendnn,
+# spyre-comms — all 2.0.0-0.main.1) plus a prebuilt ~/build/llvm and
+# ~/llvm-project at the pinned commit. So we do NOT rebuild the native stack or
+# LLVM; we only add the missing Python layer (torch 2.11, torch_sendnn,
+# torch-spyre) on top.
+#
+# Why this image exists / how it differs from Dockerfile.base.s390x:
+#   - Dockerfile.base.s390x rebuilds flex/deeptools/libaiupti/sendnn + LLVM from
+#     source (~40 min LLVM + the AIU stack) on the older granite-eval base.
+#   - Here the native stack is prebuilt and validated sound (coherent versions,
+#     no broken deps/undefined symbols, the CONST-ABI setPipelineBarrier(bool)
+#     const + VF stream schedulers present in libflex.so, VF verified end-to-end
+#     on hardware). So we REUSE it via a symlink farm and skip those builds.
+#
+# Image contract (MUST match Dockerfile.base.s390x so Dockerfile.app.s390x
+# builds on top unchanged):
+#   - VIRTUAL_ENV=${DTI_PROJECT_ROOT}/.venv (python3.12, lib64 scheme) holding
+#     torch 2.11 + torch_spyre + torch_sendnn + torchvision; .venv/bin on PATH.
+#   - SENTIENT_BASE_INSTALL_DIR=${DTI_PROJECT_ROOT}/sentient with
+#     runtime/ deeptools/ libaiupti/ spyre_comms/ (each lib/ + bin/). Here this
+#     is a SYMLINK FARM onto /opt/ibm/spyre/*, so SPYRE_OVERLAY_DIR (captured by
+#     the app image) and the base RPM tree resolve to the SAME single libflex.
+#   - PYTHON_VERSION=3.12, LANG/LC_ALL, UV_* and the rust/openssl build envs.
+#
+# Python environment:
+#   torch-spyre-docs scripts (dev-env.sh, build-torch-spyre.sh) require an
+#   activated venv. We create ${DTI_PROJECT_ROOT}/.venv with
+#   --system-site-packages so it inherits the base image's /usr/local packages
+#   while torch 2.11 / torch_sendnn / torch-spyre install into the venv.
+#
+# Build:
+#   eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519_gh ~/.ssh/id_ed25519_ghe
+#   cd /Users/ritikdhiranan/PycharmProjects
+#   podman build --format docker \
+#       --security-opt seccomp=unconfined --security-opt label=disable \
+#       --ssh default=$SSH_AUTH_SOCK \
+#       --build-arg GITHUB_USER=$(git config --get github.user) \
+#       -f spyre-inference/Dockerfile-torch-spyre.s390x \
+#       -t localhost/spyre-toolchain:s390x \
+#       .
+#
+#   --format docker         : honor the SHELL directive below (OCI ignores it).
+#   --security-opt seccomp=unconfined --security-opt label=disable :
+#       s390x build hosts otherwise block glibc's RELRO mprotect with
+#       "cannot apply additional memory protection after relocation".
+#
+# Build context note: must be the parent of both spyre-inference/ and
+# torch-spyre-docs/ so the COPY ./torch-spyre-docs line resolves.
+##############################################
+
+ARG BASE_IMAGE="icr.io/ai_sw_accel/2.0/spyre-backend:latest-198-s390x"
+
+FROM ${BASE_IMAGE} AS toolchain
+
+ARG GITHUB_USER
+ARG TORCH_VERSION="2.11.0"
+# torch-spyre tracks `main` (where the stream-based VF support lives). FLEX_REF
+# is informational only on this image — flex is NOT rebuilt; we link the
+# prebuilt /opt/ibm/spyre flex. Override TORCH_SPYRE_REF with a SHA as a
+# fallback if a future main regresses the build.
+ARG TORCH_SPYRE_REF="main"
+ARG FLEX_REF="main"
+# LLVM pin from torch-spyre-docs/scripts/checkout-required-src.sh — the prebuilt
+# ~/build/llvm + ~/llvm-project in the base are already at this commit.
+ARG LLVM_COMMIT="dd6f6a096a59892ce1f9c454461aa5ed4c2aa971"
+ARG PYTHON_VERSION="3.12"
+ARG MAX_JOBS="16"
+
+USER root
+# Non-login shell: the base image's /etc/profile.d/ has a broken cp invocation
+# that spams stderr on every -lc shell startup. We don't need any of the base
+# image's profile.d exports at build time — all required env is set via ENV.
+SHELL ["/usr/bin/bash", "-c"]
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHON_VERSION=${PYTHON_VERSION}
+
+##############################################
+# Step 1 — build toolchain deps needed to compile the torch-spyre _C.so /
+# torch_sendnn wheel (cmake, ninja, ccache, jq, perl-core, clang, python-devel,
+# etc.). Idempotent — most may already be present in the 2.0 base.
+##############################################
+RUN dnf install -y \
+        libsndfile \
+        libtiff-devel libpng-devel libwebp-devel \
+        freetype-devel harfbuzz-devel \
+        ninja-build \
+        autoconf automake libtool \
+        golang \
+        dnf-plugins-core \
+        libxml2-devel libxslt libxslt-devel \
+        gcc-gfortran \
+        clang clang-devel \
+        openssl openssl-devel pkgconf-pkg-config \
+        numactl-libs \
+        ccache jq perl-core \
+        cmake make git patch \
+        python3-devel && \
+    dnf clean all
+# Notes on dropped packages (not available in UBI 10 / el10 for s390x, covered
+# elsewhere): libatomic-devel (glibc provides libatomic; gcc-c++ has builtins),
+# libomp/libomp-devel (GCC's libgomp covers the OpenMP runtime needs).
+
+##############################################
+# Step 1b — install uv. The granite-eval base shipped uv; the 2.0 base does NOT
+# (uv: command not found), and dev-env.sh / build-torch-spyre.sh require it.
+# Prefer the PyPI wheel; fall back to the standalone installer (prebuilt binary)
+# if no s390x wheel is published.
+##############################################
+RUN python3 -m pip install --no-cache-dir uv || \
+    { curl -LsSf https://astral.sh/uv/install.sh | \
+        env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh; } && \
+    command -v uv && uv --version
+
+##############################################
+# Step 2 — workspace layout + env. SAME contract as Dockerfile.base.s390x: all
+# builds target a uv venv at ${DTI_PROJECT_ROOT}/.venv created with
+# --system-site-packages. DTI_PROJECT_ROOT=/home/senuser so checkout-required-
+# src.sh reuses the base's prebuilt ~/llvm-project + ~/torch-spyre-docs (already
+# at the pin / main) instead of a multi-GB full clone, and ~/build/llvm sits
+# where dev-env.sh expects it.
+##############################################
+ENV DTI_PROJECT_ROOT=/home/senuser
+ENV SEN_PROJECT_SRC=${DTI_PROJECT_ROOT} \
+    SEN_PROJECT_BUILD=${DTI_PROJECT_ROOT}/build \
+    SENTIENT_BASE_INSTALL_DIR=${DTI_PROJECT_ROOT}/sentient \
+    DTI_LLVM_SRC_DIR=${DTI_PROJECT_ROOT}/llvm-project \
+    LLVM_PROJ_SRC=${DTI_PROJECT_ROOT}/llvm-project \
+    LLVM_PROJ_BUILD=${DTI_PROJECT_ROOT}/build/llvm \
+    LLVM_EXTERNAL_LIT=${DTI_PROJECT_ROOT}/build/llvm/bin/llvm-lit
+ENV DEEPTOOLS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/deeptools \
+    DEEPTOOLS_PATH=${SENTIENT_BASE_INSTALL_DIR}/deeptools/share \
+    RUNTIME_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    RUNTIME_FULL_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    SENDNN_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    SENDNN_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/runtime \
+    LIBAIUPTI_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/libaiupti \
+    SPYRE_COMMS_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms \
+    SENLIB_INSTALL_DIR=/opt/ibm/spyre/senlib
+
+# flex's CMakeLists creates the SenLib::senlib imported target with include dir
+# ${SENLIB_PATH}/include. We don't build senlib (the 2.0 base ships it); point
+# at the base's senlib (verified to have include/ + lib/).
+
+ENV PYTHONPATH=${SENTIENT_BASE_INSTALL_DIR}/runtime/lib \
+    PATH=${DTI_PROJECT_ROOT}/.venv/bin:${SENTIENT_BASE_INSTALL_DIR}/runtime/bin:${SENTIENT_BASE_INSTALL_DIR}/deeptools/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=${SENTIENT_BASE_INSTALL_DIR}/spyre_comms/lib:${SENTIENT_BASE_INSTALL_DIR}/libaiupti/lib:${SENTIENT_BASE_INSTALL_DIR}/runtime/lib:${SENTIENT_BASE_INSTALL_DIR}/deeptools/lib:/opt/ibm/spyre/senlib/lib:/usr/local/lib:/usr/lib64 \
+    MAX_JOBS=${MAX_JOBS}
+
+# Route ALL C/C++ compiles through ccache so the torch-spyre _C.so rebuild
+# benefits from the /root/.ccache cache mount on re-runs.
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CCACHE_DIR=/root/.ccache \
+    CCACHE_MAXSIZE=30G
+
+# venv targeting for uv. dev-env.sh activates the venv during the build scripts;
+# these vars make uv target it for the RUN steps that don't source dev-env.sh.
+ENV VIRTUAL_ENV=${DTI_PROJECT_ROOT}/.venv \
+    UV_PROJECT_ENVIRONMENT=${DTI_PROJECT_ROOT}/.venv \
+    UV_PYTHON_PREFERENCE=only-system \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# Rust/grpc/openssl crate build envs (consumed by the app image's rust/hf-xet/
+# vllm stages, which inherit this image's ENV).
+ENV LIBCLANG_PATH=/usr/lib64 \
+    OPENSSL_DIR=/usr \
+    OPENSSL_LIB_DIR=/usr/lib64 \
+    OPENSSL_INCLUDE_DIR=/usr/include \
+    OPENSSL_NO_VENDOR=1 \
+    GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 \
+    GRPC_PYTHON_DISABLE_LIBC_COMPILER_CHECK=1
+
+RUN mkdir -p ${DTI_PROJECT_ROOT}
+WORKDIR ${DTI_PROJECT_ROOT}
+
+##############################################
+# Step 2b — git safe.directory + the SYMLINK FARM. The prebuilt sources/repos
+# under /home/senuser are senuser-owned; root git ops need safe.directory.
+#
+# The symlink farm maps the overlay tree dev-env.sh expects
+# (${SENTIENT_BASE_INSTALL_DIR}=/home/senuser/sentient) onto the prebuilt native
+# stack at /opt/ibm/spyre. So sourcing dev-env.sh UNCHANGED makes the
+# torch-spyre / torch_sendnn build find the prebuilt flex/deeptools/sendnn/
+# spyre-comms libs + headers. Note the dash->underscore rename
+# (spyre-comms -> spyre_comms) and that libaiupti.so lives in runtime/lib, so
+# sentient/libaiupti -> /opt/ibm/spyre/runtime.
+##############################################
+RUN git config --global --add safe.directory '*' && \
+    mkdir -p ${SENTIENT_BASE_INSTALL_DIR} && \
+    ln -sfn /opt/ibm/spyre/runtime     ${SENTIENT_BASE_INSTALL_DIR}/runtime && \
+    ln -sfn /opt/ibm/spyre/deeptools   ${SENTIENT_BASE_INSTALL_DIR}/deeptools && \
+    ln -sfn /opt/ibm/spyre/spyre-comms ${SENTIENT_BASE_INSTALL_DIR}/spyre_comms && \
+    ln -sfn /opt/ibm/spyre/runtime     ${SENTIENT_BASE_INSTALL_DIR}/libaiupti && \
+    ls -l ${SENTIENT_BASE_INSTALL_DIR}
+
+##############################################
+# Step 3 — create the uv venv with --system-site-packages, then install torch
+# 2.11.0+cpu into the venv. PyTorch publishes manylinux2014_s390x wheels for
+# torch >= 2.4.
+##############################################
+RUN uv venv --system-site-packages --python /usr/bin/python3.12 ${DTI_PROJECT_ROOT}/.venv
+
+RUN uv pip install --no-cache \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==${TORCH_VERSION}"
+
+##############################################
+# Step 3b — torchvision. Do NOT let the resolver pick it: the pytorch-cpu index
+# has no torchvision s390x wheel for torch 2.11, so it falls back to an ancient
+# PyPI sdist lacking InterpolationMode (transformers hard-fails on it). Install a
+# prebuilt s390x torchvision wheel from ./spyre-inference/wheels/ (--no-deps so
+# it doesn't drag torch off PyPI). If none provided, fall back to the base
+# image's system torchvision.
+##############################################
+COPY ./spyre-inference/wheels/ /tmp/extra-wheels/
+RUN VENV_SP=${DTI_PROJECT_ROOT}/.venv/lib64/python${PYTHON_VERSION}/site-packages && \
+    rm -rf "${VENV_SP}/torchvision" "${VENV_SP}"/torchvision-*.dist-info && \
+    tv="$(ls /tmp/extra-wheels/torchvision-*.whl 2>/dev/null | head -1)" && \
+    if [ -n "${tv}" ]; then \
+        echo "Installing prebuilt torchvision wheel: ${tv}" && \
+        uv pip install --no-cache --no-deps "${tv}" && \
+        python3 -c "import torchvision; from torchvision.transforms import InterpolationMode; print('torchvision ok:', torchvision.__version__)" ; \
+    else \
+        echo "No torchvision wheel in ./spyre-inference/wheels/ — using base image system torchvision" ; \
+    fi && \
+    rm -rf /tmp/extra-wheels
+
+##############################################
+# Step 4 — bootstrap the uv-managed build tools (into the venv) needed to build
+# torch_sendnn (python -m build) and torch-spyre (uv sync / _C.so).
+##############################################
+RUN uv pip install --no-cache \
+        "nanobind==2.9.2" ninja "pybind11==3.0.1" build "cmake~=3.26" regex wheel
+
+##############################################
+# Step 5 — pin torch-spyre-docs to our checked-out version (the build-script
+# versions we validated). Replace the base image's in-place copy.
+##############################################
+RUN rm -rf ${DTI_PROJECT_ROOT}/torch-spyre-docs
+COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
+
+##############################################
+# Step 6 — SSH host keys + clone required sources via BuildKit SSH mount.
+#
+# checkout-required-src.sh has a bug in the `--github-user` path (an unguarded
+# `local` at top level). Workaround: pre-set `git config --global github.user`
+# and invoke WITHOUT `--github-user`. If GITHUB_USER is empty, fall back to
+# --no-fork. The script clones torch-spyre (fork) + torch_sendnn (the two we
+# build); it SKIPS the already-present ~/llvm-project (at the pin) and
+# ~/torch-spyre-docs. It also clones deeptools/flex/spyre-comms source which we
+# do NOT build (we link the prebuilt /opt/ibm/spyre libs); those are slimmed in
+# Step 9.
+##############################################
+RUN mkdir -p /root/.ssh && \
+    ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
+
+RUN --mount=type=ssh \
+    cd ${DTI_PROJECT_ROOT} && \
+    if [ -n "${GITHUB_USER}" ]; then \
+        git config --global github.user "${GITHUB_USER}" && \
+        ./torch-spyre-docs/scripts/checkout-required-src.sh \
+            --non-interactive --update ; \
+    else \
+        ./torch-spyre-docs/scripts/checkout-required-src.sh \
+            --non-interactive --no-fork --update ; \
+    fi
+
+##############################################
+# Step 7 — check out torch-spyre at TORCH_SPYRE_REF (default `main`).
+# checkout-required-src.sh already leaves it on main; this re-fetches and checks
+# out the ref so a SHA override (fallback) also works. flex is NOT checked out /
+# rebuilt — we link the prebuilt /opt/ibm/spyre flex.
+##############################################
+RUN --mount=type=ssh \
+    cd ${DTI_PROJECT_ROOT}/torch-spyre && \
+    git fetch --all --tags --prune && \
+    git checkout ${TORCH_SPYRE_REF}
+
+##############################################
+# Step 8 — build ONLY the Python layer against the prebuilt native stack:
+# torch_sendnn (wheel) then torch-spyre (_C.so + package). This replaces the
+# base image's `build-everything.sh --tspyre` (which would rebuild deeptools/
+# flex/libaiupti/sendnn/spyre-comms) and the separate LLVM build — all prebuilt
+# here. dev-env.sh activates the venv and points the build at the symlink farm.
+##############################################
+RUN --mount=type=cache,target=/root/.ccache \
+    set -e && \
+    cd ${DTI_PROJECT_ROOT} && \
+    . ./torch-spyre-docs/scripts/dev-env.sh && \
+    ./torch-spyre-docs/scripts/build-torch-sendnn.sh --simple && \
+    ./torch-spyre-docs/scripts/build-torch-spyre.sh && \
+    ccache --show-stats || true
+
+##############################################
+# Step 9 — smoke test + guards, then slim.
+# Smoke test must run with dev-env.sh sourced so LD_LIBRARY_PATH points at the
+# (symlinked) prebuilt flex/deeptools/libaiupti.
+##############################################
+RUN . ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/dev-env.sh && \
+    python3 -c "import torch, torch_spyre, torch_sendnn; \
+                print('toolchain ok:', torch.__version__, 'torch_spyre@', torch_spyre.__file__)"
+
+# flex symbol guard — ${RUNTIME_INSTALL_DIR}/lib resolves via the symlink farm
+# to /opt/ibm/spyre/runtime/lib (the prebuilt const-ABI flex w/ VF schedulers).
+RUN nm -D ${RUNTIME_INSTALL_DIR}/lib/libflex.so | \
+        grep -E 'RuntimeOperationCompute|setPipelineBarrier' >/dev/null || \
+    { echo "ERROR: ${RUNTIME_INSTALL_DIR}/lib/libflex.so missing required symbols"; exit 1; }
+
+# Single const-ABI libflex guard. With the prebuilt 2.0 base there is only one
+# libflex (the const build at /opt/ibm/spyre/runtime/lib, reached via the
+# overlay symlink), so this is a fast no-op that also asserts the invariant the
+# app image relies on. SPYRE_OVERLAY_DIR=${SENTIENT_BASE_INSTALL_DIR}.
+COPY ./spyre-inference/container-scripts/reconcile-flex-runtime.sh /usr/local/bin/reconcile-flex-runtime.sh
+RUN chmod +x /usr/local/bin/reconcile-flex-runtime.sh && \
+    SPYRE_OVERLAY_DIR=${SENTIENT_BASE_INSTALL_DIR} /usr/local/bin/reconcile-flex-runtime.sh
+
+# Slim: drop the build tree (incl. the unused prebuilt LLVM build) and the LLVM
+# source. Keep the cloned AIU sources so the app stage can still find flex
+# headers if needed.
+#
+# Ownership/cleanup is intentionally NOT done here — same as Dockerfile.base.s390x.
+# We build as root and leave files root-owned (umask 022 => world-readable, so
+# senuser can read/exec the venv). Dockerfile.app.s390x is the authoritative
+# normalizer: its release stage creates senuser (UID 1234, GID 0), runs
+# `chown -R 1234:0 /home/senuser /etc/aiu` + `chmod -R g+rwX`, and removes the
+# /tmp/etc topo caches (Dockerfile.app.s390x:385-405). Because DTI_PROJECT_ROOT
+# is /home/senuser here, that chown now also covers the venv + sources — and it
+# is safe over the symlink farm (chown -R does not traverse symlinks, so
+# /opt/ibm/spyre is left untouched).
+RUN rm -rf ${SEN_PROJECT_BUILD} ${DTI_PROJECT_ROOT}/llvm-project
+
+# Final WORKDIR — downstream Dockerfile inherits.
+WORKDIR ${DTI_PROJECT_ROOT}
