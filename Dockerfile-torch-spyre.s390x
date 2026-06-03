@@ -82,18 +82,34 @@ ENV LANG=C.UTF-8 \
     PYTHON_VERSION=${PYTHON_VERSION}
 
 ##############################################
-# Step 1 — build toolchain deps needed to compile the torch-spyre _C.so
-# (cmake, ninja, ccache, jq, clang, python3-devel, …). Idempotent — the
-# runtime-dev base likely already has most of these.
+# Step 1 — build toolchain deps. This image is the base for Dockerfile.app.s390x,
+# whose builder stages build numactl/opencv/vllm/hf-xet from source, so we
+# provide a full build toolchain (matching the original Dockerfile.base.s390x
+# package set), not just what the torch-spyre _C.so compile needs. e.g. numactl's
+# autogen.sh needs autoreconf (autoconf/automake/libtool). Idempotent — the
+# runtime-dev base already has gcc/gcc-c++/python3.12-devel.
 ##############################################
 RUN dnf install -y \
         gcc gcc-c++ \
+        libsndfile \
+        libtiff-devel libpng-devel libwebp-devel \
+        freetype-devel harfbuzz-devel \
         ninja-build \
-        ccache jq \
+        autoconf automake libtool \
+        golang \
+        dnf-plugins-core \
+        libxml2-devel libxslt libxslt-devel \
+        gcc-gfortran \
+        clang clang-devel \
+        openssl openssl-devel pkgconf-pkg-config \
+        numactl-libs \
+        ccache jq perl-core \
         cmake make git patch \
-        python3.12-devel \
-        openssl openssl-devel pkgconf-pkg-config && \
+        python3.12-devel && \
     dnf clean all
+# Notes on dropped packages (not available in UBI 10 / el10 for s390x, covered
+# elsewhere): libatomic-devel (glibc provides libatomic; gcc-c++ has builtins),
+# libomp/libomp-devel (GCC's libgomp covers the OpenMP runtime needs).
 
 ##############################################
 # Step 2 — workspace layout + env. SAME contract as Dockerfile.base.s390x.
