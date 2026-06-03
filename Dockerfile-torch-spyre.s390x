@@ -63,6 +63,12 @@ ARG TORCH_VERSION="2.11.0"
 # torch-spyre tracks `main`; the base's flex (8c0adfc) carries the matching
 # MemoryType / VF-compute API. Override with a SHA only as a fallback.
 ARG TORCH_SPYRE_REF="main"
+# flex SOURCE is cloned (not built) only so torch-spyre's _C.so can resolve flex
+# source headers — chiefly the `common` submodule (common/self_doc_enum.hpp),
+# which the installed /opt/ibm/spyre flex headers reference but don't ship.
+# MUST match the base image's ibm-flex RPM commit (`rpm -q ibm-flex` ->
+# 2.0.0-…+269.8c0adfc); bump this if the base's flex changes.
+ARG FLEX_REF="8c0adfc179a08d071c6eb8caf79a5d1f0c369057"
 ARG PYTHON_VERSION="3.12"
 ARG MAX_JOBS="16"
 
@@ -188,11 +194,19 @@ RUN rm -rf ${DTI_PROJECT_ROOT}/torch-spyre-docs
 COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
 
 ##############################################
-# Step 6 — SSH host keys + clone ONLY torch-spyre (the one thing we build). We
-# do NOT run checkout-required-src.sh: every other repo it clones (deeptools,
-# flex, spyre-comms, libaiupti, torch_sendnn) is already prebuilt in this base,
-# and it would also full-clone the huge llvm-project (this base ships no prebuilt
-# llvm-project to skip). torch-spyre is cloned from the upstream org over SSH.
+# Step 6 — SSH host keys + clone torch-spyre (built) and flex source (headers
+# only, NOT built). We do NOT run checkout-required-src.sh: the native stack
+# (deeptools, flex binary, spyre-comms, libaiupti, torch_sendnn) is prebuilt in
+# this base, and the script would also full-clone the huge llvm-project (no
+# prebuilt llvm-project here to skip).
+#
+# flex source is required because torch-spyre's _C.so build adds
+# -I${DTI_PROJECT_ROOT}/flex and includes flex's `common` submodule headers
+# (e.g. common/self_doc_enum.hpp, pulled in transitively by senlib's pic.hpp).
+# The installed /opt/ibm/spyre flex headers reference but don't ship those, so
+# we clone flex WITH submodules at FLEX_REF (matching the base's ibm-flex RPM)
+# purely for headers — flex itself is not rebuilt. The `common` submodule lives
+# on github.ibm.com (spyre_common_headers), reachable with the same SSH key.
 ##############################################
 RUN mkdir -p /root/.ssh && \
     ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
@@ -203,6 +217,14 @@ RUN --mount=type=ssh \
     cd torch-spyre && \
     git fetch --all --tags --prune && \
     git checkout ${TORCH_SPYRE_REF}
+
+RUN --mount=type=ssh \
+    cd ${DTI_PROJECT_ROOT} && \
+    git clone --recurse-submodules git@github.ibm.com:ai-chip-toolchain/flex.git flex && \
+    cd flex && \
+    git fetch --all --tags --prune && \
+    git checkout ${FLEX_REF} && \
+    git submodule update --init --recursive
 
 ##############################################
 # Step 7 — build ONLY torch-spyre against the prebuilt VF-capable flex/deeptools
