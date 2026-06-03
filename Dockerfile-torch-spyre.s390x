@@ -264,11 +264,21 @@ COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
 # checkout-required-src.sh has a bug in the `--github-user` path (an unguarded
 # `local` at top level). Workaround: pre-set `git config --global github.user`
 # and invoke WITHOUT `--github-user`. If GITHUB_USER is empty, fall back to
-# --no-fork. The script clones torch-spyre (fork) + torch_sendnn (the two we
-# build); it SKIPS the already-present ~/llvm-project (at the pin) and
-# ~/torch-spyre-docs. It also clones deeptools/flex/spyre-comms source which we
-# do NOT build (we link the prebuilt /opt/ibm/spyre libs); those are slimmed in
-# Step 9.
+# --no-fork. The script clones torch-spyre + torch_sendnn (the two we build);
+# it SKIPS the already-present ~/llvm-project (at the pin) and ~/torch-spyre-docs.
+# It also clones deeptools/flex/spyre-comms source which we do NOT build (we link
+# the prebuilt /opt/ibm/spyre libs); those are slimmed in Step 9.
+#
+# NB: the `--no-fork` path must NOT be combined with `--update`. With --no-fork
+# the script clones torch-spyre as `origin` but never adds an `upstream` remote;
+# `--update` then makes sync_from_upstream run `git fetch upstream` -> "no such
+# remote" (exit 128). Omitting --update makes sync_from_upstream return early
+# ("Skipping upstream sync"), which is what we want: the repos are freshly cloned
+# at their default branch, and check_branch_ref / check_commit_pin still check out
+# the right branch / verify the llvm pin without needing --update (verified
+# against the script). Our Step 7 then pins torch-spyre to ${TORCH_SPYRE_REF}.
+# The fork branch (GITHUB_USER set) keeps --update — that path adds the upstream
+# remote correctly, so the sync works (it is what the granite-eval base used).
 ##############################################
 RUN mkdir -p /root/.ssh && \
     ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
@@ -281,7 +291,7 @@ RUN --mount=type=ssh \
             --non-interactive --update ; \
     else \
         ./torch-spyre-docs/scripts/checkout-required-src.sh \
-            --non-interactive --no-fork --update ; \
+            --non-interactive --no-fork ; \
     fi
 
 ##############################################
