@@ -234,12 +234,19 @@ COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
 RUN mkdir -p /root/.ssh && \
     ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
 
+# Bump TORCH_SPYRE_CACHEBUST (e.g. --build-arg TORCH_SPYRE_CACHEBUST=$(date +%s))
+# to force a fresh clone+build of torch-spyre WITHOUT re-running the expensive
+# dnf/pip layers above. Needed whenever the branch tip moves but the ref name
+# does not (podman would otherwise reuse the cached clone of the old commit).
+ARG TORCH_SPYRE_CACHEBUST=0
 RUN --mount=type=ssh \
+    echo "torch-spyre cachebust: ${TORCH_SPYRE_CACHEBUST}" && \
     cd ${DTI_PROJECT_ROOT} && \
     git clone ${TORCH_SPYRE_REPO} torch-spyre && \
     cd torch-spyre && \
     git fetch --all --tags --prune && \
-    git checkout ${TORCH_SPYRE_REF}
+    git checkout ${TORCH_SPYRE_REF} && \
+    git log --oneline -1
 
 RUN --mount=type=ssh \
     cd ${DTI_PROJECT_ROOT} && \
@@ -260,7 +267,7 @@ RUN --mount=type=cache,target=/root/.ccache \
     cd ${DTI_PROJECT_ROOT} && \
     . ./torch-spyre-docs/scripts/dev-env.sh && \
     ./torch-spyre-docs/scripts/build-torch-spyre.sh && \
-    ccache --show-stats || true
+    { ccache --show-stats || true; }
 
 ##############################################
 # Step 8 — smoke test + guards. dev-env.sh sets PYTHONPATH=…/runtime/lib so the
