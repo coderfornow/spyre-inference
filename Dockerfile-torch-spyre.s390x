@@ -60,15 +60,22 @@ ARG BASE_IMAGE="icr.io/zai_spyre/s390x/spyre-runtime-dev:main"
 FROM ${BASE_IMAGE} AS toolchain
 
 ARG TORCH_VERSION="2.11.0"
-# torch-spyre tracks `main`; the base's flex (8c0adfc) carries the matching
-# MemoryType / VF-compute API. Override with a SHA only as a fallback.
-ARG TORCH_SPYRE_REF="main"
+# Testing torch-spyre PR #2426 (storage_offset / 0x0105 VFStreamPartialFailure
+# fix, flex issue #1104). The PR conflicted with main, so the branch below is
+# PR #2426's net change rebased onto current main (c7861a0) and pushed to the
+# coderfornow fork. Revert TORCH_SPYRE_REPO/REF to the upstream `main` once the
+# PR merges.
+ARG TORCH_SPYRE_REPO="git@github.com:coderfornow/torch-spyre.git"
+ARG TORCH_SPYRE_REF="storage-offset-fix-2426"
 # flex SOURCE is cloned (not built) only so torch-spyre's _C.so can resolve flex
 # source headers — chiefly the `common` submodule (common/self_doc_enum.hpp),
 # which the installed /opt/ibm/spyre flex headers reference but don't ship.
-# MUST match the base image's ibm-flex RPM commit (`rpm -q ibm-flex` ->
-# 2.0.0-…+269.8c0adfc); bump this if the base's flex changes.
-ARG FLEX_REF="8c0adfc179a08d071c6eb8caf79a5d1f0c369057"
+# MUST match the base image's ibm-flex RPM commit (`rpm -q ibm-flex`). Bumped to
+# flex main (eae2784) because PR #2426's _C.so calls the 4-arg
+# RuntimeOperationCompute(..., tensor_byte_offsets) ctor added by flex #1099
+# (merged daf1d82) and used by the VF runtime fix in flex #1103 (merged be768fc).
+# The base image MUST carry a flex RPM at/after be768fc for this to link+run.
+ARG FLEX_REF="eae27840c5803e20aa3537972958aaf7ac024849"
 ARG PYTHON_VERSION="3.12"
 ARG MAX_JOBS="16"
 
@@ -229,7 +236,7 @@ RUN mkdir -p /root/.ssh && \
 
 RUN --mount=type=ssh \
     cd ${DTI_PROJECT_ROOT} && \
-    git clone git@github.com:torch-spyre/torch-spyre.git torch-spyre && \
+    git clone ${TORCH_SPYRE_REPO} torch-spyre && \
     cd torch-spyre && \
     git fetch --all --tags --prune && \
     git checkout ${TORCH_SPYRE_REF}
