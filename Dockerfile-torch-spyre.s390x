@@ -61,12 +61,13 @@ FROM ${BASE_IMAGE} AS toolchain
 
 ARG TORCH_VERSION="2.11.0"
 # Testing torch-spyre PR #2426 (storage_offset / 0x0105 VFStreamPartialFailure
-# fix, flex issue #1104). The PR conflicted with main, so the branch below is
-# PR #2426's net change rebased onto current main (c7861a0) and pushed to the
-# coderfornow fork. Revert TORCH_SPYRE_REPO/REF to the upstream `main` once the
-# PR merges.
-ARG TORCH_SPYRE_REPO="git@github.com:coderfornow/torch-spyre.git"
-ARG TORCH_SPYRE_REF="storage-offset-fix-2426"
+# fix, flex issue #1104), built straight from the upstream PR head. The PR is now
+# rebased clean on main and carries the flex-main ctor fix
+# (RuntimeOperationCompute(..., flex::PROG_OFFSET_BASE, tensor_byte_offsets)).
+# TORCH_SPYRE_REF is the PR's GitHub head ref, fetched explicitly in the clone
+# step below. Revert REPO/REF to upstream `main` once the PR merges.
+ARG TORCH_SPYRE_REPO="git@github.com:torch-spyre/torch-spyre.git"
+ARG TORCH_SPYRE_REF="refs/pull/2426/head"
 # flex SOURCE is cloned (not built) only so torch-spyre's _C.so can resolve flex
 # source headers — chiefly the `common` submodule (common/self_doc_enum.hpp),
 # which the installed /opt/ibm/spyre flex headers reference but don't ship.
@@ -244,8 +245,8 @@ RUN --mount=type=ssh \
     cd ${DTI_PROJECT_ROOT} && \
     git clone ${TORCH_SPYRE_REPO} torch-spyre && \
     cd torch-spyre && \
-    git fetch --all --tags --prune && \
-    git checkout ${TORCH_SPYRE_REF} && \
+    git fetch --tags --prune origin "${TORCH_SPYRE_REF}:torch-spyre-build" && \
+    git checkout torch-spyre-build && \
     git log --oneline -1
 
 RUN --mount=type=ssh \
