@@ -60,12 +60,15 @@ ARG BASE_IMAGE="icr.io/zai_spyre/s390x/spyre-runtime-dev:main"
 FROM ${BASE_IMAGE} AS toolchain
 
 ARG TORCH_VERSION="2.11.0"
-# Building torch-spyre from the abhishekkunuru6-cmyk fork's `diff` branch (the
-# WIP under test for the VF numeric-garbage RCA). TORCH_SPYRE_REF is fetched
-# explicitly in the clone step below. Point REPO/REF back at upstream
+# Building torch-spyre from coderfornow's `symbolic-stride-guard` branch:
+# abhishekkunuru6-cmyk `diff` (storage_offset fix, PR #2426) + the scratchpad
+# guard in _per_core_view_on_buf that stops the eager-serving InductorError
+# "Cannot convert symbols to int" on transposed-view d2d copies (triggered by
+# spyre-inference PR #206 list-based paged attention). TORCH_SPYRE_REF is
+# fetched explicitly in the clone step below. Point REPO/REF back at upstream
 # torch-spyre `main` (or a PR head ref) once this work lands.
-ARG TORCH_SPYRE_REPO="git@github.com:abhishekkunuru6-cmyk/torch-spyre.git"
-ARG TORCH_SPYRE_REF="refs/heads/diff"
+ARG TORCH_SPYRE_REPO="git@github.com:coderfornow/torch-spyre.git"
+ARG TORCH_SPYRE_REF="refs/heads/symbolic-stride-guard"
 # flex SOURCE is cloned (not built) only so torch-spyre's _C.so can resolve flex
 # source headers — chiefly the `common` submodule (common/self_doc_enum.hpp),
 # which the installed /opt/ibm/spyre flex headers reference but don't ship.
