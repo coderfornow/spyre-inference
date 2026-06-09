@@ -81,6 +81,18 @@ class TorchSpyrePlatform(CpuPlatform):
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     @classmethod
+    def opaque_attention_op(cls) -> bool:
+        # This is required to keep the output tensor of attention on Spyre.
+        # Inherited from CpuPlatform as True, which would route attention through
+        # torch.ops.vllm.unified_attention_with_output.
+        # This override disables the opaque-op boundary and vLLM then calls the
+        # Attention.forward directly.
+        #
+        # This has though implications for torch.compile, because if
+        # enforce_eager=False, the attention implementation is also traced and compiled.
+        return False
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 
@@ -150,10 +162,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
-        if selected_backend == AttentionBackendEnum.CUSTOM:
-            return AttentionBackendEnum.CUSTOM.get_path()
-        else:
-            return super().get_attn_backend_cls(selected_backend, *args, **kwargs)
+        return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

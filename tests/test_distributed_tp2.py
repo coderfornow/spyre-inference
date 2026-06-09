@@ -65,11 +65,61 @@ def test_tp2_tensor_model_parallel_all_reduce(run_tp_probe) -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
+def test_tp2_vocab_parallel_embedding(run_tp_probe) -> None:
+    """End-to-end TP=2 SpyreVocabParallelEmbedding forward on real Spyre cards.
+
+    Spawns one subprocess per rank, brings up spyreccl through vllm's
+    real init path, constructs the OOT VocabParallelEmbedding, and
+    asserts each rank's all-reduced output matches the full-vocab
+    F.embedding reference. Independent of #134 (linear TP).
+
+    Isolates the embedding-TP correctness check from #134 (linear TP) and
+    #136-equivalent (LM head TP) so the embedding work can land
+    independently. When the full LLM(tp=2) test passes, this is
+    redundant and can be deleted.
+    """
+    run_tp_probe("vocab_parallel_embedding", world_size=2)
+
+
+@pytest.mark.spyre
+@pytest.mark.uses_subprocess
+@pytest.mark.skipif(
+    _spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "merged_column_parallel_linear",
+        "qkv_parallel_linear",
+        "row_parallel_linear",
+    ],
+)
+def test_tp_linear_layers(run_tp_probe, probe: str) -> None:
+    """End-to-end TP=2 test of a Spyre linear layer on Spyre cards.
+
+    Spawns one subprocess per rank, running through vllm's real
+    `init_worker_distributed_environment` against a real `VllmConfig`,
+    then verifies the layer returns numerically correct results on
+    TP=2 with Spyre communication. Parametrized over the three layer
+    types: SpyreMergedColumnParallelLinear (output sharding),
+    SpyreQKVParallelLinear (Q/K/V sharding), and SpyreRowParallelLinear
+    (input sharding).
+    """
+    run_tp_probe(probe, world_size=2)
+
+
+@pytest.mark.spyre
+@pytest.mark.uses_subprocess
+@pytest.mark.skipif(
+    _spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(
         "needs TP-aware Spyre custom linear layers (#134) and "
-        "TP-aware vocab embedding / LM head (#135). "
+        "TP-aware LM head (still pending — embedding done in #135). "
         "MultiprocExecutor + spyreccl init succeed; failure is at "
         "SpyreQKVParallelLinear NotImplementedError(TP>1)."
     ),
@@ -105,10 +155,10 @@ def test_tp2_llm_construction() -> None:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "needs #134, #135, and a TP=2 fallback for all_gather "
-        "(LM head logits gather hits unimplemented _allgather_base). "
-        "When all three land, TP=1 vs TP=2 should match on the first "
-        "few decoded tokens."
+        "needs #134, the LM head half of #135, and a TP=2 fallback for "
+        "all_gather (LM head logits gather hits unimplemented "
+        "_allgather_base). When all three land, TP=1 vs TP=2 should "
+        "match on the first few decoded tokens."
     ),
 )
 def test_tp2_llm_generate_matches_tp1() -> None:
