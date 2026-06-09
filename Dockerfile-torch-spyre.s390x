@@ -60,14 +60,12 @@ ARG BASE_IMAGE="icr.io/zai_spyre/s390x/spyre-runtime-dev:main"
 FROM ${BASE_IMAGE} AS toolchain
 
 ARG TORCH_VERSION="2.11.0"
-# Testing torch-spyre PR #2426 (storage_offset / 0x0105 VFStreamPartialFailure
-# fix, flex issue #1104), built straight from the upstream PR head. The PR is now
-# rebased clean on main and carries the flex-main ctor fix
-# (RuntimeOperationCompute(..., flex::PROG_OFFSET_BASE, tensor_byte_offsets)).
-# TORCH_SPYRE_REF is the PR's GitHub head ref, fetched explicitly in the clone
-# step below. Revert REPO/REF to upstream `main` once the PR merges.
-ARG TORCH_SPYRE_REPO="git@github.com:torch-spyre/torch-spyre.git"
-ARG TORCH_SPYRE_REF="refs/pull/2426/head"
+# Building torch-spyre from the abhishekkunuru6-cmyk fork's `diff` branch (the
+# WIP under test for the VF numeric-garbage RCA). TORCH_SPYRE_REF is fetched
+# explicitly in the clone step below. Point REPO/REF back at upstream
+# torch-spyre `main` (or a PR head ref) once this work lands.
+ARG TORCH_SPYRE_REPO="git@github.com:abhishekkunuru6-cmyk/torch-spyre.git"
+ARG TORCH_SPYRE_REF="refs/heads/diff"
 # flex SOURCE is cloned (not built) only so torch-spyre's _C.so can resolve flex
 # source headers — chiefly the `common` submodule (common/self_doc_enum.hpp),
 # which the installed /opt/ibm/spyre flex headers reference but don't ship.
