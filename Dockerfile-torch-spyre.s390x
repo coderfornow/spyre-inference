@@ -221,6 +221,14 @@ RUN uv pip install --no-cache \
 RUN rm -rf ${DTI_PROJECT_ROOT}/torch-spyre-docs
 COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
 
+# build-torch-spyre.sh's post-build step generates clangd compile_commands from
+# each extension's build.ninja. torch-spyre #2539 removed the _hooks extension,
+# so `ninja -f build/torch_spyre._hooks/build.ninja ...` fails and aborts the
+# build under `set -e` even though torch-spyre compiled fine. Drop that line
+# (LSP-only convenience, not needed in the image); the _C compdb + jq remain.
+RUN sed -i '/torch_spyre\._hooks\/build\.ninja/d' \
+        ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/build-torch-spyre.sh
+
 ##############################################
 # Step 6 — SSH host keys + clone torch-spyre (built) and flex source (headers
 # only, NOT built). We do NOT run checkout-required-src.sh: the native stack
