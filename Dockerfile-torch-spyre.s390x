@@ -75,12 +75,20 @@ ARG TORCH_SPYRE_REF="refs/heads/vf-storage-offset-no-guard"
 # flex SOURCE is cloned (not built) only so torch-spyre's _C.so can resolve flex
 # source headers — chiefly the `common` submodule (common/self_doc_enum.hpp),
 # which the installed /opt/ibm/spyre flex headers reference but don't ship.
-# MUST match the base image's ibm-flex RPM commit (`rpm -q ibm-flex`). Bumped to
-# flex main (eae2784) because PR #2426's _C.so calls the 4-arg
-# RuntimeOperationCompute(..., tensor_byte_offsets) ctor added by flex #1099
-# (merged daf1d82) and used by the VF runtime fix in flex #1103 (merged be768fc).
-# The base image MUST carry a flex RPM at/after be768fc for this to link+run.
-ARG FLEX_REF="eae27840c5803e20aa3537972958aaf7ac024849"
+# MUST match the base image's ibm-flex RPM commit (`rpm -q ibm-flex`). Bumped from
+# eae2784 to flex #933 (098dc615 "add factory methods for runtime operations to
+# protect abi") because torch-spyre main now constructs RuntimeOperations via the
+# ABI-protected factory API — RuntimeStream::launchOperation{H2D,D2H,Compute,
+# HostCallback}(flex::{DmaParams,ComputeParams,HostCallbackParams}*) — adopted in
+# torch-spyre #2727 "Fix CI through Flex API changes" (job_plan.cpp). eae2784
+# (#1124, 2026-06-05) PREDATES that API and lacks ComputeParams/HostCallbackParams,
+# so building torch-spyre main against it fails with "'flex::ComputeParams' has not
+# been declared". 098dc615 (#933, 2026-06-16) is the minimal flex commit that
+# declares all three Params structs + the launchOperation* overloads torch-spyre
+# calls. PREREQUISITE: the base image's ibm-flex RPM must ALSO be at/after 098dc615
+# (the launchOperation* symbols resolve INTO libflex.so); verify with
+# `rpm -q ibm-flex` and keep this ref == that commit.
+ARG FLEX_REF="098dc615307a3806e78535f6ae7f7cfbccea9f98"
 # NOTE: the spyre-comms big-endian rank-exchange fix (SocketOOB::setup_communication
 # announced the connecting rank via write(&myrank_, sizeof(int)) where myrank_ is
 # uint64_t, so on s390x the high zero bytes hit the wire and the listener read
