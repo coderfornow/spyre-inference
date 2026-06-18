@@ -1181,6 +1181,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#distributed-tp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distributed (TP)
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1479,6 +1490,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#distributed-tp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distributed (TP)
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1572,22 +1594,28 @@ decorator intercepts and returns the Spyre implementation instead.</p>
 <td>Fallback — Spyre doesn't support strided views</td>
 </tr>
 <tr>
+<td><code>VocabParallelEmbedding</code></td>
+<td><code>SpyreVocabParallelEmbedding</code></td>
+<td>Spyre + CPU</td>
+<td>TP shard mask runs on CPU (Spyre inductor rejects int64 constants); embedding lookup on Spyre</td>
+</tr>
+<tr>
 <td><code>QKVParallelLinear</code></td>
 <td><code>SpyreQKVParallelLinear</code></td>
-<td>Spyre</td>
-<td>TP=1 only, <code>F.linear()</code></td>
+<td>Spyre + CPU</td>
+<td>TP≥1, <code>F.linear()</code> on Spyre, D2H after for downstream <code>.split()</code></td>
 </tr>
 <tr>
 <td><code>RowParallelLinear</code></td>
 <td><code>SpyreRowParallelLinear</code></td>
 <td>Spyre</td>
-<td>TP=1 only, <code>F.linear()</code></td>
+<td>TP≥1, <code>F.linear()</code> + <code>all_reduce</code> when <code>reduce_results=True</code></td>
 </tr>
 <tr>
 <td><code>MergedColumnParallelLinear</code></td>
 <td><code>SpyreMergedColumnParallelLinear</code></td>
 <td>Spyre</td>
-<td>TP=1 only, <code>F.linear()</code></td>
+<td>TP≥1, <code>F.linear()</code></td>
 </tr>
 <tr>
 <td><code>SiluAndMul</code></td>
@@ -1599,14 +1627,16 @@ decorator intercepts and returns the Spyre implementation instead.</p>
 <td><code>ParallelLMHead</code></td>
 <td><code>SpyreParallelLMHead</code></td>
 <td>Spyre</td>
-<td>Vocab size padded to 64×32 boundary</td>
+<td>TP≥1; vocab partition padded up to a multiple of 64×32</td>
 </tr>
 </tbody>
 </table>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>The <code>SpyreAttentionBackend</code> implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). Most prep work runs on CPU; the hot inner kernel is a single
-compiled 4D attention call on Spyre:</p>
+(no custom CUDA kernels). The KV cache is a list of per-page tensors on Spyre — each
+page is <code>[num_kv_heads, block_size, head_size]</code> — rather than a monolithic tensor. The
+default backend runs a FlashAttention-style online softmax that iterates over pages
+without any compact-gather step:</p>
 <table>
 <thead>
 <tr>
@@ -1617,40 +1647,43 @@ compiled 4D attention call on Spyre:</p>
 </thead>
 <tbody>
 <tr>
-<td>1. KV cache update</td>
+<td>1. q/k/v → CPU</td>
 <td>CPU</td>
-<td>Scatter new keys/values via <code>slot_mapping</code></td>
+<td>Bring <code>q</code>, <code>k</code>, <code>v</code> to CPU once (Spyre slicing corrupts strided views)</td>
 </tr>
 <tr>
-<td>2. Gather compact KV</td>
-<td>CPU</td>
-<td>Gather pages into per-seq tensors, pad <code>seq_len</code> to 256</td>
-</tr>
-<tr>
-<td>3. Reshape Q + build mask</td>
-<td>CPU</td>
-<td>Pad <code>query_len</code> to 32, build additive mask (<code>0.0</code> / <code>-65504.0</code>)</td>
-</tr>
-<tr>
-<td>4. 4D attention kernel</td>
+<td>2. Reshape &amp; cache</td>
 <td>Spyre</td>
-<td>One compiled call: <code>Q @ Kᵀ</code> → <code>+ mask</code> → <code>softmax</code> → <code>@ V</code></td>
+<td>Per-token overwrite of new K/V into the list-of-pages cache</td>
 </tr>
 <tr>
-<td>5. Output extract</td>
+<td>3. Per-sequence varlen loop</td>
 <td>CPU</td>
-<td>Trim query/sequence padding back to <code>num_actual_tokens</code></td>
+<td>Iterate sequences via <code>query_start_loc</code>, pad <code>query_len</code> to 32</td>
+</tr>
+<tr>
+<td>4. Online softmax over pages</td>
+<td>Spyre</td>
+<td>Compiled per <code>(num_blocks, padded_query_len)</code> kernel: <code>Q @ Kᵀ</code> → <code>+ tile_mask</code> → online softmax → <code>@ V</code></td>
+</tr>
+<tr>
+<td>5. Per-token write-back</td>
+<td>Spyre</td>
+<td><code>spyre.overwrite</code> each result token into the output buffer</td>
 </tr>
 </tbody>
 </table>
-<p>The backend also exposes an <code>use_sdpa=True</code> fallback path that routes through
-<code>torch.nn.functional.scaled_dot_product_attention</code> on CPU — currently used for cases that
-the 4D kernel doesn't cover (no GQA, non-square attention).</p>
+<p>A second backend selectable via <code>SPYRE_ATTN_IMPL=exp</code> (file
+<code>spyre_attn_exp.py</code>) keeps the older "gather compact KV → single 4D attention call →
+trim padding" pipeline. It is gated on <code>max_num_seqs=1</code> and an explicit
+<code>num_gpu_blocks_override</code>, and is preserved for benchmarking the on-device-cache path.</p>
 <p>Key constraints:</p>
 <ul>
 <li><strong>KV length alignment</strong>: 256 tokens (avoids per-step recompilation on Spyre)</li>
 <li><strong>Query chunk size</strong>: 32 tokens (consistent tensor shapes for compilation)</li>
 <li><strong>Head size</strong>: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)</li>
+<li><strong>GQA only</strong>: MHA (<code>num_queries_per_kv = 1</code>) currently fails in the Spyre compiler's
+  layout-propagation pass; only GQA configurations are exercised today.</li>
 </ul>
 <h2 id="device-placement-strategy">Device Placement Strategy<a class="headerlink" href="#device-placement-strategy" title="Permanent link">&para;</a></h2>
 <p><code>TorchSpyreModelRunner</code> inherits from vLLM's <code>GPUModelRunner</code> and treats Spyre as the
@@ -1669,13 +1702,28 @@ call boundary:</p>
 <li><strong>Input</strong>: CPU <code>int32</code>/<code>int64</code> tensors → Spyre <code>int64</code> (for embedding lookup)</li>
 <li><strong>Output</strong>: Spyre <code>float16</code> tensors → CPU (for logits indexing and sampling)</li>
 </ul>
-<p><code>VocabParallelEmbedding</code> is <strong>not</strong> OOT-replaced — it is the upstream vLLM class. Its
-weights are moved onto Spyre by <code>model.to(spyre_device)</code> during <code>load_model</code>, and the
-wrapper supplies an <code>int64</code> Spyre tensor at the input, so the embedding lookup runs on
-Spyre without any custom op.</p>
-<p>Hidden states flow entirely on Spyre between decoder layers, with CPU round-trips only
-for operations that Spyre doesn't yet support natively (rotary embeddings, attention
-KV scatter/gather, logits indexing).</p>
+<p>The embedding lookup itself runs on Spyre via <code>SpyreVocabParallelEmbedding</code>, which
+inherits weight loading and shard arithmetic from upstream and only overrides <code>forward</code>
+to compute the TP shard mask on CPU (the upstream helper does int64 comparisons against
+Python int constants, which the Spyre inductor backend rejects).</p>
+<p>Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
+operations that Spyre doesn't yet support natively (rotary embeddings, q/k/v slicing,
+the per-sequence attention varlen loop, logits indexing).</p>
+<h2 id="distributed-tp">Distributed (TP)<a class="headerlink" href="#distributed-tp" title="Permanent link">&para;</a></h2>
+<p><code>TorchSpyrePlatform.get_device_communicator_cls</code> returns <code>SpyreCommunicator</code>, a
+<code>DeviceCommunicatorBase</code> override that lives in
+<code>spyre_inference/distributed/spyre_communicator.py</code>. It exists because the installed
+<code>libspyre_comms.so</code> only implements <code>barrier</code>, <code>broadcast</code>, single-tensor <code>allgather</code>,
+and pairwise <code>send</code>/<code>recv</code>; the list-form <code>allgather</code>, <code>allreduce</code>, <code>gather</code>, and
+<code>reduce</code> overrides on <code>SpyreCommsContext</code> are throw-stubs.</p>
+<p>For the TP=2 forward path, <code>SpyreCommunicator.all_reduce</code> provides a manual
+send/recv-then-broadcast fallback. <code>all_gather</code> and <code>gather</code> route CPU tensors through
+the gloo half of the multi-backend <code>cpu:gloo,spyre:spyreccl</code> device group; Spyre
+tensors raise a clear <code>NotImplementedError</code> describing what's needed to unblock them.
+Each fallback is tagged <code>REPLACE-WITH-NATIVE</code> so the file can be deleted (or pared back
+to genuine perf overrides) once the comms library catches up. The
+<code>tests/test_spyre_comms_native_probes.py</code> xfail-strict suite is the canonical signal:
+when a probe flips green, delete the corresponding override.</p>
 
 
 
