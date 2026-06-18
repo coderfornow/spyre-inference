@@ -51,8 +51,10 @@
 #   --security-opt seccomp=unconfined --security-opt label=disable :
 #       s390x build hosts otherwise block glibc's RELRO mprotect.
 #
-# Build context note: must be the parent of both spyre-inference/ and
-# torch-spyre-docs/ so the COPY ./torch-spyre-docs line resolves.
+# Build context note: must be the parent of spyre-inference/ so the
+# `COPY ./spyre-inference/container-scripts/...` line resolves. torch-spyre-docs
+# is now cloned fresh from upstream over SSH in Step 6 (not COPY'd), so it no
+# longer needs to be present in the build context.
 ##############################################
 
 ARG BASE_IMAGE="icr.io/zai_spyre/s390x/spyre-runtime-dev:main"
@@ -239,19 +241,11 @@ RUN uv pip install --no-cache \
         "nanobind==2.9.2" ninja "pybind11==3.0.1" build "cmake~=3.26" regex wheel
 
 ##############################################
-# Step 5 — pin torch-spyre-docs to our checked-out version (the build-script
-# versions we validated).
+# Step 5 — (torch-spyre-docs is no longer COPY'd from the local build context;
+# it is cloned fresh from upstream over SSH in Step 6 so the image always tracks
+# the latest validated build scripts instead of a possibly-stale local checkout.
+# See the TORCH_SPYRE_DOCS_* ARGs + the docs clone in Step 6.)
 ##############################################
-RUN rm -rf ${DTI_PROJECT_ROOT}/torch-spyre-docs
-COPY ./torch-spyre-docs ${DTI_PROJECT_ROOT}/torch-spyre-docs
-
-# build-torch-spyre.sh's post-build step generates clangd compile_commands from
-# each extension's build.ninja. torch-spyre #2539 removed the _hooks extension,
-# so `ninja -f build/torch_spyre._hooks/build.ninja ...` fails and aborts the
-# build under `set -e` even though torch-spyre compiled fine. Drop that line
-# (LSP-only convenience, not needed in the image); the _C compdb + jq remain.
-RUN sed -i '/torch_spyre\._hooks\/build\.ninja/d' \
-        ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/build-torch-spyre.sh
 
 ##############################################
 # Step 6 — SSH host keys + clone torch-spyre (built) and flex source (headers
@@ -270,6 +264,34 @@ RUN sed -i '/torch_spyre\._hooks\/build\.ninja/d' \
 ##############################################
 RUN mkdir -p /root/.ssh && \
     ssh-keyscan -t rsa,ed25519 github.com github.ibm.com >> /root/.ssh/known_hosts 2>/dev/null
+
+# torch-spyre-docs supplies the build scripts (dev-env.sh, build-torch-spyre.sh,
+# build-spyre-comms.sh) that Steps 6b/7/8 source. Clone it FRESH from upstream
+# (over SSH) so the image always uses the latest validated build scripts instead
+# of a COPY of a possibly-stale local checkout.
+#   The `_hooks` sed is STILL REQUIRED (verified against torch-spyre-docs main):
+#   build-torch-spyre.sh line ~82 still runs
+#   `ninja -f build/torch_spyre._hooks/build.ninja -t compdb`, but torch-spyre
+#   #2539 removed the _hooks extension (only a _hooks.pyi stub remains, no build
+#   target), so that ninja invocation fails "No such file" and aborts the build
+#   under `set -e`. The sed drops that LSP-only compdb line (the _C compdb + jq
+#   merge remain); it is a harmless no-op once upstream drops the line itself.
+# Bump TORCH_SPYRE_DOCS_CACHEBUST (e.g. --build-arg TORCH_SPYRE_DOCS_CACHEBUST=$(date +%s))
+# to force a re-clone when the ref tip moves but the ref name does not.
+ARG TORCH_SPYRE_DOCS_REPO="git@github.ibm.com:ai-foundation/torch-spyre-docs.git"
+ARG TORCH_SPYRE_DOCS_REF="refs/heads/main"
+ARG TORCH_SPYRE_DOCS_CACHEBUST=0
+RUN --mount=type=ssh \
+    echo "torch-spyre-docs cachebust: ${TORCH_SPYRE_DOCS_CACHEBUST}" && \
+    cd ${DTI_PROJECT_ROOT} && \
+    rm -rf torch-spyre-docs && \
+    git clone ${TORCH_SPYRE_DOCS_REPO} torch-spyre-docs && \
+    cd torch-spyre-docs && \
+    git fetch --tags --prune origin "${TORCH_SPYRE_DOCS_REF}:torch-spyre-docs-build" && \
+    git checkout torch-spyre-docs-build && \
+    git log --oneline -1 && \
+    sed -i '/torch_spyre\._hooks\/build\.ninja/d' \
+        ${DTI_PROJECT_ROOT}/torch-spyre-docs/scripts/build-torch-spyre.sh
 
 # Bump TORCH_SPYRE_CACHEBUST (e.g. --build-arg TORCH_SPYRE_CACHEBUST=$(date +%s))
 # to force a fresh clone+build of torch-spyre WITHOUT re-running the expensive
@@ -327,7 +349,20 @@ RUN --mount=type=ssh --mount=type=cache,target=/root/.ccache \
     test -n "$NEWLIB" && echo "patched lib: $NEWLIB" && \
     for t in libspyre_comms.so libspyre_comms.so.1; do \
         cp -f "$NEWLIB" /opt/ibm/spyre/spyre-comms/lib/$t; done && \
-    ls -l /opt/ibm/spyre/spyre-comms/lib/libspyre_comms.so*
+    ls -l /opt/ibm/spyre/spyre-comms/lib/libspyre_comms.so* && \
+    echo "--- validating spyre-comms big-endian rank-fix overlay ---" && \
+    INSTALLED=/opt/ibm/spyre/spyre-comms/lib/libspyre_comms.so.1 && \
+    grep -aq myrank_wire "$INSTALLED" || \
+        { echo "ERROR: spyre-comms overlay did NOT take: marker 'myrank_wire' (our s390x"\
+               "rank-exchange fix) not found in $INSTALLED. The stock RPM .so would break"\
+               "TP>=2 rendezvous ('Source rank and target rank are the same'). Failing build."; \
+          exit 1; } && \
+    SZ=$(stat -c %s "$INSTALLED") && \
+    test "$SZ" -gt 5000000 || \
+        { echo "ERROR: $INSTALLED is only $SZ bytes; the stock stripped RPM is ~1.7MB and the"\
+               "RelWithDebInfo patched build is ~50MB, so the overlay almost certainly did not"\
+               "apply. Failing build."; exit 1; } && \
+    echo "OK: spyre-comms patch verified in $INSTALLED (myrank_wire present, size=$SZ bytes)"
 
 ##############################################
 # Step 7 — build ONLY torch-spyre against the prebuilt VF-capable flex/deeptools
