@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.metadata
+import math
 import multiprocessing
 import os
 import sys
@@ -176,6 +177,23 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
+        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
+        # The list-based attention backend requires 64-element stick alignment for
+        # torch.compile. Only override default (non-user-specified) values.
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_block_size:
+            original_block_size = cache_config.block_size
+            if original_block_size % 64 != 0:
+                # Round up to nearest multiple of 64
+                new_block_size = ((original_block_size + 63) // 64) * 64
+                logger.warning(
+                    "Block size must be a multiple of 64 for the list-based attention "
+                    "backend. Overriding block_size from %d to %d.",
+                    original_block_size,
+                    new_block_size,
+                )
+                cache_config.block_size = new_block_size
+
         parallel_config = vllm_config.parallel_config
 
         # Spyre does not currently support data parallelism. The worker's
@@ -219,3 +237,20 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
+
+        # Pin the on-device KV cache to exactly what's needed to fill the
+        # configured batch area: max_num_seqs sequences × ceil(max_model_len /
+        # block_size) blocks each. Anything more is over-allocation while
+        # the attention op is still unoptimized.
+        cache_config = vllm_config.cache_config
+        if cache_config.num_gpu_blocks_override is None:
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            max_model_len = vllm_config.model_config.max_model_len
+            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+            cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+            logger.info(
+                "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                cache_config.num_gpu_blocks_override,
+                max_num_seqs,
+                blocks_per_seq,
+            )
