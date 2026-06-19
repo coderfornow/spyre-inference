@@ -40,9 +40,15 @@ Run (inside the spyre-inference s390x container, on a 2-PF pod):
 
 Container needs the TP=2 resource flags:
     --pids-limit=-1 --ulimit nproc=65535:65535 -e OMP_NUM_THREADS=8
+
+Byte-level endianness demo only (no hardware / torchrun / devices needed -
+runs anywhere, shows WHY rank 1 is read as 0 on big-endian):
+
+    python3 spyre_comms_bigendian_repro.py --demo
 """
 
 import os
+import struct
 import sys
 
 # Control when libspyre_comms loads (it reads RANK/WORLD_SIZE/LOCAL_RANK/
@@ -51,8 +57,10 @@ import sys
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 os.environ.setdefault("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))
 
-import torch
-import torch.distributed as dist
+# torch is imported lazily inside main() (after the --demo early-return) so the
+# pure-python `--demo` byte illustration runs anywhere, with no torch installed.
+torch = None  # set in main()
+dist = None  # set in main()
 
 SENTINEL = 123.0  # not a plausible byte-swap of any expected value below
 N = 1024
@@ -66,6 +74,33 @@ def classify(actual, expected):
     if torch.allclose(a, torch.full_like(a, SENTINEL), atol=1e-3):
         return "FAIL/UNTOUCHED"
     return f"FAIL/WRONG(min={a.min().item():.4g}, max={a.max().item():.4g})"
+
+
+def endianness_demo(rank: int) -> str:
+    """Pure-python illustration of the spyre-comms rank-exchange byte bug.
+
+    SocketOOB::setup_communication announced the rank with
+    `write_on_socket(&myrank_, sizeof(int))` where myrank_ is uint64_t, while
+    the listener reads a 4-byte `unsigned`. Shipping only the first sizeof(int)
+    bytes of an 8-byte value sends the HIGH-order bytes on big-endian -> they
+    are zero for any real rank -> the peer reads rank 0 ("Source rank and
+    target rank are the same"). The fix sends the value as a fixed-width
+    unsigned (the actual low bytes). No hardware needed; this is just bytes.
+    """
+    full8 = struct.pack("=Q", rank)  # native 8-byte uint64 == myrank_
+    buggy_wire = full8[:4]  # write_on_socket(&myrank_, sizeof(int))
+    buggy_read = struct.unpack("=I", buggy_wire)[0]  # listener reads 4-byte unsigned
+    fixed_wire = struct.pack("=I", rank)  # static_cast<unsigned>(myrank_)
+    fixed_read = struct.unpack("=I", fixed_wire)[0]
+    return (
+        f"  host byte order       : {sys.byteorder}-endian\n"
+        f"  rank to announce      : {rank}\n"
+        f"  myrank_ uint64 bytes  : {full8.hex(' ')}\n"
+        f"  BUGGY wire (first 4B) : {buggy_wire.hex(' ')}  -> peer reads rank "
+        f"{buggy_read}{'   <-- WRONG (big-endian truncation)' if buggy_read != rank else ''}\n"
+        f"  FIXED wire (uint32)   : {fixed_wire.hex(' ')}  -> peer reads rank "
+        f"{fixed_read}{'   <-- correct' if fixed_read == rank else ''}"
+    )
 
 
 def run_broadcast(device, world_size, rank):
@@ -138,9 +173,37 @@ PROBES = [
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Print the endianness byte-level demo and exit (no hardware/torchrun needed).",
+    )
+    args, _ = parser.parse_known_args()
+    if args.demo:
+        for r in (0, 1):
+            print(f"\n=== rank-exchange endianness demo for rank {r} ===\n{endianness_demo(r)}")
+        return 0
+
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
+
+    # Show the byte-level reason BEFORE init, so it prints even on stock comms
+    # where init_process_group dies at the rendezvous.
+    print(
+        f"\n[rank {rank}] rank-exchange wire bytes "
+        f"(why stock rendezvous fails on big-endian):\n{endianness_demo(rank)}",
+        flush=True,
+    )
+
+    # Lazy torch import (env above must be set first); bind as module globals so
+    # the probe/classify functions resolve them.
+    global torch, dist
+    import torch
+    import torch.distributed as dist
 
     import torch_spyre
 
