@@ -16,6 +16,7 @@
 This example shows how to run offline inference on Spyre using the torch-spyre
 plugin code with the TorchSpyreModelRunner.
 
+By default this runs with torch.compile (STOCK_TORCH_COMPILE).
 Use --enforce-eager to skip torch.compile and run in eager mode.
 """
 
@@ -61,7 +62,7 @@ def parse_args():
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
-        help="Skip torch.compile, run in eager mode",
+        help="Skip torch.compile (whole model and attention kernel), run in eager mode",
     )
     return parser.parse_args()
 
@@ -124,6 +125,8 @@ def main():
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens
     ]
 
+    # The platform derives the compile mode from enforce_eager, so no explicit
+    # compilation_config is needed.
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -135,6 +138,14 @@ def main():
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
+
+    # When compiling, run an untimed warmup pass first so any lazy per-shape
+    # Inductor recompiles happen outside the timed GENERATE window below.
+    if not args.enforce_eager:
+        print("=============== WARMUP")
+        t_warm = time.time()
+        llm.generate(prompts, sampling_params)
+        print(f"Warmup pass took {time.time() - t_warm:.2f} sec")
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.

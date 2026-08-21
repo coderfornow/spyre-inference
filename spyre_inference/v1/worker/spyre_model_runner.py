@@ -21,8 +21,8 @@ Data flow in the current WIP version:
 - self.device = CPU. Buffers and scatter ops stay on CPU.
 - _SpyreModelWrapper converts input_ids/positions to Spyre int64 at the
   model call boundary.
-- _SpyreModelWrapper converts final hidden_states to CPU for downstream
-  operations (logits indexing, lm_head, sampling).
+- Generative: D2H hidden_states for logits/sampling. Pooling: keep on Spyre;
+  pooler D2Hs only the final pooled vectors in ``_pool``.
 - Embedding: Spyre int64 input → Spyre compute → float16 output on Spyre.
 - Hidden states flow on Spyre between decoder layers.
 - There are few exceptions where a CPU fallback is currently needed:
@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -48,26 +49,42 @@ from torch.utils._pytree import tree_map
 import numpy as np
 
 from vllm.config import VllmConfig, CompilationMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.tasks import PoolingTask
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+    PoolerOutput,
+)
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
-from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
-from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
+from spyre_inference.custom_ops.head_pad import (
+    fix_padded_attention_scale,
+    fix_padded_rope,
+    install_head_pad_weight_loader,
+    install_padded_head_dim,
+    reject_padded_qk_norm,
+    verify_padded_head_dim,
+)
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.pool import (
+    TOKEN_POOLING_TASKS,
+    configure_pooling_for_spyre,
+    copy_pooler_output_to_cpu,
+    select_rows,
+)
 
 logger = init_logger(__name__)
 
-# Observed Spyre DMA failure threshold for encoder-only dummy batches with
-# multiple sequences.  Pooling warmup stays below this limit.
-SPYRE_ENCODER_DMA_TOKEN_LIMIT = 30
-# Token count for pooling warmup (single sequence), kept under the DMA limit.
+# Eager pooling warmup: one short sequence so the dummy stays compile-cheap.
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
+
 
 # Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
 # (unavailable with VLLM_TARGET_DEVICE=empty).
@@ -212,11 +229,6 @@ class _SpyreModelWrapper:
         The lm_head matmul runs on Spyre via SpyreParallelLMHead,
         which handles H2D/D2H for the sample_hidden_states subset.
 
-    RoPE priming (per forward pass):
-        Gather each RoPE module's per-token rotation slice on the host (no D2H)
-        and stash it in the forward context; forward_oot reads it back, shared
-        across all attention layers.
-
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
     (which calls self.model(...) directly).
@@ -226,17 +238,14 @@ class _SpyreModelWrapper:
         self,
         model: nn.Module,
         spyre_device: torch.device,
-        rope_modules: list[_SpyreRotaryMixin] | None = None,
+        keep_outputs_on_device: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
-        object.__setattr__(self, "_rope_modules", rope_modules or [])
+        object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
 
     def __call__(self, *args, **kwargs):
-        # Prime RoPE while positions are still on the host (no D2H).
-        self._prime_rope_rotation(kwargs.get("positions"))
-
         # Convert integer tensor inputs to Spyre int64
         def _convert_int(t):
             if (
@@ -259,33 +268,19 @@ class _SpyreModelWrapper:
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
-        def _to_cpu(x):
-            return convert(x, device="cpu")
+        # Pooling: keep on Spyre. Generative: D2H for sampling.
+        if not self._keep_outputs_on_device:
 
-        result = tree_map(_to_cpu, result)
+            def _to_cpu(x):
+                return convert(x, device="cpu")
+
+            result = tree_map(_to_cpu, result)
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
-
-    def _prime_rope_rotation(self, positions: torch.Tensor | None) -> None:
-        """Pre-gather each RoPE module's per-token rotation slice into the forward
-        context. Modules with no Spyre path return None from gather_rotation."""
-        if positions is None or not self._rope_modules or not is_forward_context_available():
-            return
-        # vLLM's positions buffer is int64; downcast on the host (free, and positions are
-        # always < max_model_len) so the on-device gather uses int32 indices directly and
-        # skips torch-spyre's internal int64 downcast.
-        positions = positions.to(torch.int32)
-        rope_rot = {}
-        for rope in self._rope_modules:
-            rot = rope.gather_rotation(positions, self._spyre_device)
-            if rot is not None:
-                rope_rot[rope._rope_key] = rot
-        if rope_rot:
-            get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -324,6 +319,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _make_buffer can place .gpu tensors on Spyre directly.
         self._spyre_device = device
 
+        # Set by load_model: whether the pooler/classifier stay on Spyre.
+        self._pooling_on_spyre = False
+
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
         # Spyre doesn't support all dtypes (int32, bool) natively.
@@ -353,31 +351,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
 
     @staticmethod
-    def _patch_encoder_ops_for_spyre(model_config) -> None:
-        """Stub ``bert._decode_token_type_ids`` with zeros; Spyre cannot lower
-        the bitwise unpack. Pooling BERT-family only (segment 0). Process-global.
-        """
-        from vllm.model_executor.models import bert
-
-        if not hasattr(bert, "_decode_token_type_ids"):
-            raise RuntimeError(
-                "vllm.model_executor.models.bert._decode_token_type_ids "
-                "not found; Spyre encoder patch needs updating for this "
-                "vLLM version."
-            )
-
+    def _install_pooling_model_patches(model_config) -> None:
+        """Install model-specific pooling adapters (BERT/RoBERTa token_type, …)."""
         if model_config.runner_type != "pooling":
             return
+        from spyre_inference.models import install_pooling_model_patches
 
-        logger.warning(
-            "Spyre: patching bert._decode_token_type_ids to zeros (segment 0 only). Model: %s",
-            model_config.model,
-        )
-
-        def _decode_token_type_ids(input_ids: torch.Tensor) -> torch.Tensor:
-            return torch.zeros_like(input_ids)
-
-        bert._decode_token_type_ids = _decode_token_type_ids  # ty: ignore[invalid-assignment]
+        install_pooling_model_patches()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -388,7 +368,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
 
-        self._patch_encoder_ops_for_spyre(self.model_config)
+        self._install_pooling_model_patches(self.model_config)
+
+        # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
+        # stream in, when the platform overrode head_dim (e.g. head_size=64).
+        # Must run before load_model builds+loads the (now 128-wide) params.
+        install_padded_head_dim(self.model_config)
+        install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -406,60 +392,38 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV projections.
-        analyze_and_unfuse(self.model)
+        # Restore original RoPE frequencies and attention scale corrupted by the
+        # head_dim width override (no-op unless the platform padded head_dim).
+        verify_padded_head_dim(self.model, self.model_config.hf_config)
+        reject_padded_qk_norm(self.model, self.model_config.hf_config)
+        fix_padded_rope(self.model, self.model_config.hf_config)
+        fix_padded_attention_scale(self.model, self.model_config.hf_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
-        # Store 2-D linear weights transposed (Wᵀ) and matmul directly, so the
-        # forward GEMM is the fast `x @ A` instead of `F.linear`'s slow `x @ Aᵀ`
-        # (torch-spyre #3512). vLLM linears aren't nn.Linear, so torch-spyre's
-        # [1,0]-layout `.to("spyre")` patch skips them; we do the equivalent here
-        # in pure PyTorch. Runs after un-fusing (QKV carries its own transpose).
-        transpose_linear_weights_for_spyre(self.model)
-
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # Pooler / classify heads run on CPU after _SpyreModelWrapper D2H's
-        # hidden_states. Cross-encoder rerankers (e.g. bge-reranker) call
-        # ClassifierPoolerHead → RobertaClassificationHead (nn.Linear) on those
-        # CPU tensors — weights must stay on CPU or F.linear hits a device
-        # mismatch (cpu activations × spyre weights). Same pattern as embed
-        # poolers (CLS/MEAN/LAST + normalize), which already assume CPU.
+        # CLS/LAST on Spyre via v1.pool; MEAN stays CPU.
+        self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
-            pinned = []
-            if hasattr(self.model, "pooler"):
-                self.model.pooler.to("cpu")
-                pinned.append("pooler")
-            if hasattr(self.model, "classifier"):
-                self.model.classifier.to("cpu")
-                pinned.append("classifier")
-            if pinned:
-                logger.info(
-                    "Pooling: kept %s on CPU (match D2H hidden_states for classify/score)",
-                    ", ".join(pinned),
-                )
+            self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
-        # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
-        # a shared instance by identity).
-        rope_modules = [m for m in self.model.modules() if isinstance(m, _SpyreRotaryMixin)]
-
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
-        # Wrap model so ALL forward() calls to the entire model,
-        # for example in execute_model, _dummy_run, etc.,
-        # automatically convert Spyre outputs to CPU. This ensures downstream
-        # indexing (logits_indices), lm_head (CPU weights), and sampling all
-        # receive CPU tensors without needing per-call-site overrides.
-        self.model = _SpyreModelWrapper(self.model, self._spyre_device, rope_modules)
+        # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
+        self.model = _SpyreModelWrapper(
+            self.model,
+            self._spyre_device,
+            keep_outputs_on_device=self._pooling_on_spyre,
+        )
 
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
@@ -503,9 +467,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Run a dummy forward pass to warm up kernels and optional compile.
 
         In eager mode, pooling models cap token count
-        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1`` to
-        stay under the Spyre DMA limit for encoder dummy batches. Compiled
-        mode uses the normal warmup size so shapes match torch.compile.
+        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1``.
+        Compiled mode uses the normal warmup size so shapes match torch.compile.
         """
         logger.info("Warming up model...")
         t0 = time.time()
@@ -519,7 +482,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 and self.vllm_config.model_config.enforce_eager
             )
             if use_eager_pooling_warmup:
-                # Match single-sequence embed metadata; cap tokens for DMA.
                 num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
                 saved_max_num_seqs = self.scheduler_config.max_num_seqs
                 try:
@@ -536,19 +498,151 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 self._dummy_run(num_tokens)
         logger.info("Warmup done in %.3fs.", time.time() - t0)
 
+    @torch.inference_mode()
+    def _dummy_run(self, *args, **kwargs):
+        """Force D2H for warmup: upstream ``hidden_states[logit_indices]`` needs CPU."""
+        wrapper = self.model
+        keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
+        if keep:
+            object.__setattr__(wrapper, "_keep_outputs_on_device", False)
+        try:
+            hidden_states, last_hidden_states = super()._dummy_run(*args, **kwargs)
+        finally:
+            if keep:
+                object.__setattr__(wrapper, "_keep_outputs_on_device", True)
+
+        if (
+            keep
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.numel() > 0
+            and hidden_states.device.type != "spyre"
+        ):
+            hidden_states = convert(hidden_states, self._spyre_device)
+        # Sampler warmup only needs last_hidden_states on CPU.
+        return hidden_states, last_hidden_states
+
+    def get_supported_pooling_tasks(self) -> list[PoolingTask]:
+        """Drop token-level tasks on Spyre pooler (slice views are unsafe)."""
+        tasks = super().get_supported_pooling_tasks()
+        if not self._pooling_on_spyre:
+            return tasks
+
+        supported = [t for t in tasks if t not in TOKEN_POOLING_TASKS]
+        if tasks and not supported:
+            raise RuntimeError(
+                f"Model {self.model_config.model} supports only token-level "
+                "pooling, which is unsupported while the pooler runs on Spyre."
+            )
+        return supported
+
+    def _pool(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
+        num_scheduled_tokens_np: np.ndarray,
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Pool on the activation device; D2H only the pooled vectors.
+
+        MEAN / FP32 heads keep the pooler on CPU — delegate to
+        ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
+        hook: dim-0 crop must use ``index_select`` (not ``[:n]``), and pooled
+        D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU). Drop this once
+        those ops are safe (fallback probes / #3507–#3508).
+        """
+        assert not self.use_async_scheduling, (
+            "async scheduling is unsupported while pooling on Spyre"
+        )
+
+        if not self._pooling_on_spyre:
+            return super()._pool(
+                convert(hidden_states, "cpu"),
+                num_scheduled_tokens,
+                num_scheduled_tokens_np,
+                kv_connector_output,
+            )
+
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs == len(self.input_batch.pooling_params), (
+            "Either all or none of the requests in a batch must be pooling request"
+        )
+
+        for params in self.input_batch.pooling_params.values():
+            if params.task in TOKEN_POOLING_TASKS:
+                raise NotImplementedError(
+                    f"Pooling task {params.task!r} returns per-sequence views "
+                    "of hidden_states, which is unsupported while the pooler "
+                    "runs on Spyre."
+                )
+
+        # Crop via index_select — Spyre dim-0 slice views are unsafe.
+        hidden_states = convert(hidden_states, self._spyre_device)
+        if hidden_states.shape[0] != num_scheduled_tokens:
+            hidden_states = select_rows(
+                hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
+            )
+
+        # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
+        # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1
+        # view is not stick-aligned on Spyre (copy_from_d2d fails). SpyreCLS/Last
+        # only read host ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.
+        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
+        pooling_metadata = self.input_batch.get_pooling_metadata()
+        pooling_metadata.build_pooling_cursor(
+            num_scheduled_tokens_np,
+            seq_lens_cpu,
+            device=torch.device("cpu"),
+        )
+
+        model = cast(VllmModelForPooling, self.model)
+        raw_pooler_output: PoolerOutput = model.pooler(
+            hidden_states=hidden_states, pooling_metadata=pooling_metadata
+        )
+
+        finished_mask = [
+            seq_len == prompt_len
+            for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
+        ]
+        raw_pooler_output = self.late_interaction_runner.postprocess_pooler_output(
+            raw_pooler_output=raw_pooler_output,
+            pooling_params=pooling_metadata.pooling_params,
+            req_ids=self.input_batch.req_ids,
+            finished_mask=finished_mask,
+        )
+
+        model_runner_output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            kv_connector_output=kv_connector_output,
+        )
+
+        if raw_pooler_output is None or not any(finished_mask):
+            model_runner_output.pooler_output = [None] * num_reqs
+            return model_runner_output
+
+        model_runner_output.pooler_output = copy_pooler_output_to_cpu(
+            raw_pooler_output=raw_pooler_output,
+            finished_mask=finished_mask,
+        )
+        self._sync_device()
+        return model_runner_output
+
     # --- KV cache allocation ---
 
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
-        """Allocate KV cache as lists of individual page tensors on Spyre.
+        """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
-        is a list of tensors of shape [num_kv_heads, block_size, head_size] on
-        the Spyre device. This matches upstream vLLM's paged model but uses
-        list indices instead of tensor indices — enabling direct per-page bmm
-        without advanced indexing.
+        is a single tensor of shape [num_blocks, block_size, num_kv_heads,
+        head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
+        advertises. The attention kernel selects a page by indexing with a
+        one-element device tensor, so the page read is a real indirect access.
         """
         from vllm.v1.worker.utils import bind_kv_cache
-        from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+        from spyre_inference.v1.attention.backends.spyre_attn import (
+            SpyrePagedKVCache,
+            slot_major_kv_layout,
+        )
 
         # Iterate kv_cache_tensors (one entry per physical buffer)
         spec_by_layer = {
@@ -565,29 +659,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Default stickification splits head_size into 64-element sticks.
-            # Alternative: stickify block_size or num_kv_heads for different
-            # access patterns (would require explicit SpyreTensorLayout).
-            k_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
-            v_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
+            # Host-allocated then transferred: only .to() takes a device_layout.
+            layout = slot_major_kv_layout(
+                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+            )
+
+            k_pages = torch.zeros(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                dtype=torch.float16,
+            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            v_pages = torch.zeros(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                dtype=torch.float16,
+            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

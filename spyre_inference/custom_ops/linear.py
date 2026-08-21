@@ -12,50 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT linear layers and the transposed-weight fast path.
+"""Spyre OOT linear layers and the shared transposed-weight fast path.
 
-`F.linear(x, W)` computes `x @ Wᵀ` regardless of how `W` is laid out, and on
-Spyre the transposed matmul is ~3.5x slower than a plain `x @ A`
-(torch-spyre issue #3512). `transpose_linear_weights_for_spyre` stores each 2-D
-linear weight physically transposed as `Wᵀ` (shape `[in, out]`, contiguous) at
-load time and swaps the GEMM to `x @ Wᵀ`, which is the fast path. It is the
-pure-PyTorch equivalent of torch-spyre's `[1,0]` weight layout, which only fires
-for `nn.Linear` and so misses every vLLM parallel-linear.
-
-The pass runs on CPU after `analyze_and_unfuse` and before the move to Spyre.
-QKV projections (already un-fused into `q/k/v_weight` by that pass) carry their
-own transpose in `unfuse.py`; the LM head transposes `padded_weight` in
-`parallel_lm_head.py`. Both reuse `spyre_linear_t` here so the fast path is
-defined once.
+`SpyreTransposedWeightMethod` is the common base for the Spyre linear and
+lm-head quant methods: it stores each 2-D weight physically transposed as `Wᵀ`
+(shape `[in, out]`, contiguous) in `process_weights_after_loading` and runs the
+Spyre-fast `x @ Wᵀ` in `apply`. Subclasses parameterize the destination
+attribute and an optional output-row padding (needed by the lm-head).
 """
 
-import types
+from typing import cast
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
-    LinearBase,
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 logger = init_logger(__name__)
-
-
-@QKVParallelLinear.register_oot(name="QKVParallelLinear")
-class SpyreQKVParallelLinear(QKVParallelLinear):
-    """Out-of-tree (OOT) QKVParallelLinear implementation for IBM's Spyre device."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert not self.gather_output, (
-            f"{self.__class__.__name__} requires gather_output=False; "
-            "all_gather is not yet supported on Spyre"
-        )
 
 
 def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
@@ -70,64 +52,115 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     return out
 
 
-def _transposed_apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None):
-    """Replacement for `UnquantizedLinearMethod.apply` using the transposed weight."""
-    return spyre_linear_t(x, layer.weight_t.data, bias)  # ty: ignore[invalid-argument-type]
+class SpyreTransposedWeightMethod:
+    """Shared Spyre weight handler: store `Wᵀ` (optionally row-padded) and matmul it.
 
+    A mixin combined *before* a concrete vLLM `Unquantized*Method` (which supplies
+    `create_weights` and the `QuantizeMethodBase` lineage), so `super()` calls in
+    the methods below reach that concrete method via the MRO. Subclasses set:
 
-def _is_unquantized(module: nn.Module) -> bool:
-    return isinstance(getattr(module, "quant_method", None), UnquantizedLinearMethod)
-
-
-def _transpose_weight(module: nn.Module, name: str) -> None:
-    """Replace `module.<name>` (a 2-D `[out, in]` Parameter) with `<name>_t` (`[in, out]`)."""
-    w = getattr(module, name).data
-    setattr(module, f"{name}_t", Parameter(w.t().contiguous(), requires_grad=False))
-    setattr(module, name, None)
-
-
-def transpose_linear_weights_for_spyre(model: nn.Module) -> None:
-    """Transpose 2-D linear weights so the forward GEMM is `x @ A` (Spyre-fast).
-
-    Runs after the checkpoint is loaded and un-fused (weights on CPU). Covers
-    generic unquantized `LinearBase` layers; un-fused QKV (`weight is None`) and
-    the LM head are transposed by their own modules.
+    - `WEIGHT_T_ATTR`: layer attribute that holds the transposed weight.
+      `"weight"` replaces it in place; a distinct name (e.g. `"padded_weight_t"`)
+      preserves the original `weight` — required for a tied lm-head whose
+      `weight` IS `embed_tokens.weight` and must keep its gather layout.
+    - `ROW_ALIGN`: pad the output (row) dim up to a multiple of this before
+      transposing (torch-spyre matmul work-division limit); `None` = no padding.
     """
-    n_linear = 0
-    n_quantized = 0
-    for module in model.modules():
-        if not isinstance(module, LinearBase):
-            continue
-        if not _is_unquantized(module):
-            # Quantized LinearBase keeps the slow `F.linear` (`x @ Aᵀ`) path: we
-            # only transpose unquantized weights. Count it so we can warn — the
-            # embedding / LM-head paths reject quantization outright, but generic
-            # linears would otherwise skip silently.
-            n_quantized += 1
-            continue
-        w = getattr(module, "weight", None)
-        # Skip un-fused QKV (weight is None; q/k/v_weight handled in unfuse.py)
-        # and anything without a plain 2-D weight.
-        if w is None or w.dim() != 2 or w.device.type != "cpu":
-            continue
-        _transpose_weight(module, "weight")
-        module.quant_method.apply = types.MethodType(  # ty: ignore[invalid-assignment]
-            _transposed_apply, module.quant_method
-        )
-        n_linear += 1
 
-    if n_quantized > 0:
-        logger.warning_once(
-            "Spyre linear transpose: %d quantized LinearBase layer(s) left on the "
-            "slow `F.linear` (x @ Aᵀ) path — the transpose fast path (torch-spyre "
-            "#3512) only applies to unquantized weights.",
-            n_quantized,
-        )
+    WEIGHT_T_ATTR: str = "weight"
+    ROW_ALIGN: int | None = None
 
-    n_head = sum(1 for m in model.modules() if isinstance(m, ParallelLMHead))
-    logger.debug(
-        "Spyre linear transpose: transposed %d linear weights (%d LM head(s) "
-        "handled in parallel_lm_head).",
-        n_linear,
-        n_head,
-    )
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+
+        w = cast(torch.Tensor, layer.weight).data
+        padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
+        layer.spyre_row_padding = padding
+        if padding:
+            padded = F.pad(w, (0, 0, 0, padding))
+            logger.warning_once(
+                "%s: weights padded from %d to %d (torch-spyre limitation) "
+                "expect numerical differences to upstream vLLM.",
+                layer.__class__.__name__,
+                w.shape[0],
+                padded.shape[0],
+            )
+            w = padded
+
+        # Store transposed (`[in, out]`, contiguous) so the forward GEMM is the
+        # Spyre-fast `x @ A`. `.t().contiguous()` gives INDEPENDENT storage, so a
+        # distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
+        setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out = spyre_linear_t(x, getattr(layer, self.WEIGHT_T_ATTR), bias)
+        padding = cast(int, layer.spyre_row_padding)
+        if padding:
+            # Drop the trailing pad columns; the slice lowers on-device eagerly
+            # (torch-spyre #3578 honors the storage offset).
+            out = out[:, :-padding]
+        return out
+
+
+class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinearMethod):
+    """Unquantized linear method: store `Wᵀ` in place and matmul it (torch-spyre #3512).
+
+    Uses the shared base defaults (`WEIGHT_T_ATTR="weight"`, no padding), so the
+    forward GEMM is the Spyre-fast `x @ Wᵀ` instead of `F.linear`'s `x @ Aᵀ`.
+    """
+
+
+class _SpyreTransposedLinearMixin:
+    """Swaps in `SpyreUnquantizedLinearMethod` for unquantized linear layers.
+
+    Mixed in before a concrete vLLM linear class so `super().__init__` builds the
+    layer normally; we then replace the unquantized method with the transposed
+    one. Quantized layers keep their own method (and the slow `F.linear` path):
+    the transpose fast path only applies to unquantized weights.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if isinstance(self.quant_method, UnquantizedLinearMethod):
+            self.quant_method = SpyreUnquantizedLinearMethod()
+
+
+@ColumnParallelLinear.register_oot(name="ColumnParallelLinear")
+class SpyreColumnParallelLinear(_SpyreTransposedLinearMixin, ColumnParallelLinear):
+    """OOT ColumnParallelLinear storing `Wᵀ` for the Spyre-fast GEMM."""
+
+
+@MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
+class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnParallelLinear):
+    """OOT MergedColumnParallelLinear (e.g. gate_up_proj) storing `Wᵀ`."""
+
+
+@RowParallelLinear.register_oot(name="RowParallelLinear")
+class SpyreRowParallelLinear(_SpyreTransposedLinearMixin, RowParallelLinear):
+    """OOT RowParallelLinear (e.g. o_proj, down_proj) storing `Wᵀ`."""
+
+
+@ReplicatedLinear.register_oot(name="ReplicatedLinear")
+class SpyreReplicatedLinear(_SpyreTransposedLinearMixin, ReplicatedLinear):
+    """OOT ReplicatedLinear storing `Wᵀ` for the Spyre-fast GEMM."""
+
+
+@QKVParallelLinear.register_oot(name="QKVParallelLinear")
+class SpyreQKVParallelLinear(_SpyreTransposedLinearMixin, QKVParallelLinear):
+    """OOT QKVParallelLinear for IBM's Spyre device.
+
+    The fused QKV output is returned whole; the model splits it on-device with
+    the unmodified `qkv.split(...)` idiom (no CPU-side unfusing).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert not self.gather_output, (
+            f"{self.__class__.__name__} requires gather_output=False; "
+            "all_gather is not yet supported on Spyre"
+        )

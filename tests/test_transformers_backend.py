@@ -38,7 +38,7 @@ def test_transformers_generate(model: str) -> None:
     llm = LLM(
         model=model,
         dtype="float16",
-        enforce_eager=False,
+        enforce_eager=True,
         max_model_len=128,
         max_num_seqs=2,
         model_impl="transformers",

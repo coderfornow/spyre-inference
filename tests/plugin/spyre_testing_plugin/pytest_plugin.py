@@ -76,7 +76,11 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
-from spyre_testing_plugin.vfio_reaper import reap_vfio_holders, spyre_hardware_present
+from spyre_testing_plugin.vfio_reaper import (
+    reap_vfio_holders,
+    spyre_hardware_present,
+    wait_until_card_free,
+)
 
 _YAML_FILENAME = "upstream_tests.yaml"
 _YAML_PATH = Path(__file__).parent / _YAML_FILENAME
@@ -96,6 +100,10 @@ def spyre_available() -> bool:
     Returns:
         True if a Spyre device can be allocated, False otherwise.
     """
+    if not spyre_hardware_present():
+        return False
+
+    wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
     try:
         torch.randn(1, device=torch.device("spyre"))
         return True
@@ -774,6 +782,29 @@ def default_vllm_config(monkeypatch):
     yield from _spyre_default_vllm_config(monkeypatch)
 
 
+def _force_eager_vllm_runner(fixturedef):
+    """Wrap the upstream ``vllm_runner`` so runners default to eager — otherwise
+    every upstream model test compiles (STOCK) and CI time balloons. A test can
+    still opt into compilation explicitly; its ``enforce_eager`` kwarg wins.
+    """
+    if getattr(fixturedef.func, "_spyre_eager_default", False):
+        return
+
+    orig_func = fixturedef.func
+
+    def _eager_runner_fixture(*args, **kwargs):
+        runner_cls = orig_func(*args, **kwargs)
+
+        def _make(*r_args, **r_kwargs):
+            r_kwargs.setdefault("enforce_eager", True)
+            return runner_cls(*r_args, **r_kwargs)
+
+        return _make
+
+    _eager_runner_fixture._spyre_eager_default = True
+    fixturedef.func = _eager_runner_fixture
+
+
 @pytest.fixture(scope="session")
 def _distributed_init(_spyre_session_config):
     """Initialize torch.distributed with gloo backend once per test session.
@@ -916,6 +947,13 @@ def relax_torch_tolerances(request, monkeypatch):
     monkeypatch.setattr(torch.testing, "assert_close", relaxed_assert_close)
 
 
+@pytest.fixture(autouse=True)
+def inference_mode():
+    """Run every test under torch.inference_mode()."""
+    with torch.inference_mode():
+        yield
+
+
 @pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
@@ -936,17 +974,18 @@ def patch_backend_list(request, monkeypatch):
     ):
         if "AttentionBackendEnum.FLEX_ATTENTION" in str(backend_to_test):
             return
-        # Force block_size=64 for list-based attention
+        # Force block_size=64 for Spyre paged attention
         # This overrides the test's default block_size=16
         kwargs["block_size"] = 64
         return orig_tbc(batch_spec, model, backend_to_test, *args, **kwargs)
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
-    # The upstream test allocates one kv_cache tensor of
-    # [num_blocks, num_kv_heads, block_size, 2 * head_size]; SpyreAttentionImpl
-    # wants (k_pages, v_pages), each a per-block list of
-    # [num_kv_heads, block_size, head_size].
+    # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
+    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
+    # layout underneath is token-major, which upstream expresses separately via
+    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
+    # layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -962,13 +1001,30 @@ def patch_backend_list(request, monkeypatch):
         kv_cache,
         attn_type=None,
         sliding_window=None,
+        kv_cache_dtype="auto",
     ):
         if backend == AttentionBackendEnum.CUSTOM:
+
+            def pin_slot_major(blocks):
+                # The KV write needs the slot-outermost layout, not the default.
+                if blocks.device.type != "spyre":
+                    return blocks
+                from spyre_inference.v1.attention.backends.spyre_attn import (
+                    slot_major_kv_layout,
+                )
+
+                nb, bs, nkvh, hs = blocks.shape
+                return blocks.cpu().to(
+                    blocks.device,
+                    device_layout=slot_major_kv_layout(nb * bs, nkvh, hs, blocks.dtype),
+                )
+
             # K and V are concatenated on the last dim.
             head_size = kv_cache.shape[-1] // 2
+            kv_cache = kv_cache.transpose(1, 2)
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
+            kv_cache = (pin_slot_major(k_blocks), pin_slot_major(v_blocks))
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,
@@ -982,6 +1038,7 @@ def patch_backend_list(request, monkeypatch):
             kv_cache,
             attn_type,
             sliding_window,
+            kv_cache_dtype,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
@@ -1002,6 +1059,8 @@ def pytest_fixture_setup(fixturedef, request):
     elif fixturedef.argname == "should_do_global_cleanup_after_test":
         fixturedef.func = lambda: False
         fixturedef.argnames = ()
+    elif fixturedef.argname == "vllm_runner":
+        _force_eager_vllm_runner(fixturedef)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -1015,14 +1074,25 @@ def pytest_runtest_makereport(item, call):
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item, nextitem):
-    """After a FAILED test on a Spyre host, force-free the card for the next test.
+    """Free the Spyre card at each test boundary on a Spyre host.
 
-    Only failures can orphan a holder, so gating to failures leaves a
-    cleanly-passing test's card alone — a cached `LLM`, or the in-process device
-    tests whose card belongs to the still-alive pytest process. `trylast` runs it
-    after all other teardown (fixture finalizers, the tests' own `del llm`).
+    A failed test can orphan a holder outright, so after a failure we reap
+    (SIGKILL the holder, then wait for the card).
+
+    A *passing* test can also leave the card transiently busy: an out-of-process
+    vLLM engine is force-killed during shutdown and the kernel's VFIO release is
+    asynchronous, so the holder is already on its way out but may not be gone by
+    the time the next test opens the device. There we only wait — killing would
+    take down a legitimately cached `LLM`, or the in-process device tests whose
+    card belongs to the still-alive pytest process.
+
+    `trylast` runs this after all other teardown (fixture finalizers, the tests'
+    own `del llm`).
     """
     if not spyre_hardware_present():
         return
     if getattr(item, "_spyre_test_failed", False):
         reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
+    else:
+        # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
+        wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
