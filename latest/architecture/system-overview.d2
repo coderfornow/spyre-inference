@@ -61,7 +61,7 @@ platform: "Platform API (used in all processes)" {
     style.stroke: "#263238"
     style.font-color: "#ffffff"
   }
-  SpyrePlatform: "TorchSpyrePlatform\n(forces float16, eager,\nCompilationMode.NONE)" {
+  SpyrePlatform: "TorchSpyrePlatform\n(forces float16; default\nSTOCK_TORCH_COMPILE,\n--enforce-eager → NONE)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -76,12 +76,12 @@ platform: "Platform API (used in all processes)" {
   CpuPlatform -> SpyrePlatform: "▷" {style.stroke-dash: 3}
 }
 
-worker: "n == num devices worker procs (TP, DP)" {
+worker: "n == TP size worker procs" {
   style.fill: "#e0e0e0"
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
 
-  CPUWorker: CPUWorker {
+  Worker: "Worker\n(gpu_worker)" {
     style.fill: "#37474f"
     style.stroke: "#263238"
     style.font-color: "#ffffff"
@@ -98,7 +98,7 @@ worker: "n == num devices worker procs (TP, DP)" {
     style.stroke: "#263238"
     style.font-color: "#ffffff"
   }
-  SpyreComm: "SpyreCommunicator\n(manual TP=2 all_reduce\nover spyreccl)" {
+  SpyreComm: "SpyreCommunicator\n(allreduce/allgather lower\nin-graph; eager fallback)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -152,6 +152,18 @@ worker: "n == num devices worker procs (TP, DP)" {
     style.font-color: "#ffffff"
     style.bold: true
   }
+  SpyreEncoderAttnBackend: "SpyreEncoderAttentionBackend\n(encoder-only, no KV cache)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  SpyreEncoderAttnImpl: "SpyreEncoderAttentionImpl\n(bidirectional SDPA)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
 
   Sampler: Sampler {
     style.fill: "#37474f"
@@ -159,7 +171,7 @@ worker: "n == num devices worker procs (TP, DP)" {
     style.font-color: "#ffffff"
   }
 
-  CPUWorker -> SpyreWorker: "▷" {style.stroke-dash: 3}
+  Worker -> SpyreWorker: "▷" {style.stroke-dash: 3}
   GPUModelRunner -> SpyreModelRunner: "▷" {style.stroke-dash: 3}
   AttentionBackend -> SpyreAttnBackend: "▷" {style.stroke-dash: 3}
   DeviceCommBase -> SpyreComm: "▷" {style.stroke-dash: 3}
@@ -171,8 +183,11 @@ worker: "n == num devices worker procs (TP, DP)" {
   SpyreModelRunner -> Sampler
   SpyreAttnBackend -> SpyreAttnImpl: creates
   SpyreAttnBackend -> SpyreMetaBuilder: creates
+  SpyreAttnBackend -> SpyreEncoderAttnBackend: "▷" {style.stroke-dash: 3}
+  SpyreAttnImpl -> SpyreEncoderAttnImpl: "▷" {style.stroke-dash: 3}
+  SpyreEncoderAttnBackend -> SpyreEncoderAttnImpl: creates
 }
 
 api.EngineClient -> engine.EngineCore: {style.stroke-dash: 3}
-engine.EngineCore -> worker.CPUWorker: "executes via"
+engine.EngineCore -> worker.Worker: "executes via"
 platform.SpyrePlatform -> worker.SpyreComm: "selects via\nget_device_communicator_cls"
