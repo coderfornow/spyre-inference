@@ -111,6 +111,18 @@ override-dependencies = [
     "pyzmq>=27.2.0",
 ]
 
+constraint-dependencies = [
+    # protobuf's upb C extension miscompiles on big-endian below 7.35.0: the wire decoder
+    # skips the int32 munge on the closed-enum path, so the first proto parse segfaults in
+    # upb_strtable_lookup2 (protocolbuffers/protobuf#24103). 33.0 was the first release to
+    # publish s390x upb wheels, so this only surfaced once ortools' `<6.34` cap — x86_64-only,
+    # but unified across platforms by the resolver — pulled protobuf back down to 6.33.x.
+    # A constraint, not an override: it has to leave ortools' cap intact on x86_64 and only
+    # force the resolver to fork. Mirrors vllm-project/vllm#54978; drop once a vLLM release
+    # carrying that requirement is picked up.
+    "protobuf==7.36.1; platform_machine == 's390x'",
+]
+
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
