@@ -301,6 +301,7 @@ markers = [
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
     "mm_encoder_attention: SpyreMMEncoderAttention and SDPA-helper tests (tests/custom_ops/test_mm_encoder_attention.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
 ]
 # --8<-- [end:test-markers-definition]
