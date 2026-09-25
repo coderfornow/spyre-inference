@@ -112,11 +112,10 @@ override-dependencies = [
 ]
 
 constraint-dependencies = [
-    # ortools caps protobuf <6.34 on x86_64 and uv unifies that onto every platform, but
-    # protobuf's upb extension segfaults on big-endian below 7.35.0 (protocolbuffers/protobuf#24103).
-    # Must be a constraint: an override replaces every requirement on a package, which would
-    # drop protobuf off x86_64 entirely. Mirrors vllm-project/vllm#54978; drop once released.
-    "protobuf==7.36.1; platform_machine == 's390x'",
+    # ortools caps protobuf <6.34 on x86_64 and uv unifies that onto every platform, landing
+    # s390x on a protobuf whose upb extension segfaults on big-endian; fixed in 7.35.0
+    # (protocolbuffers/protobuf#24103).
+    "protobuf>=7.35.0; platform_machine == 's390x'",
 ]
 
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
