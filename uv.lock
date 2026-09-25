@@ -54,7 +54,7 @@ members = [
     "spyre-inference",
     "spyre-testing-plugin",
 ]
-constraints = [{ name = "protobuf", marker = "platform_machine == 's390x'", specifier = "==7.36.1" }]
+constraints = [{ name = "protobuf", marker = "platform_machine == 's390x'", specifier = ">=7.35.0" }]
 overrides = [
     { name = "ortools", marker = "platform_machine == 'x86_64'", specifier = ">=9.0" },
     { name = "pyarrow", marker = "platform_machine not in 's390x, ppc64le'" },
