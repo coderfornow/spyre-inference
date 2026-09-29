@@ -30,7 +30,13 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK, align_up, padded_attn_mask, padded_sdpa
+from spyre_inference.multimodal.utils import (
+    STICK,
+    align_up,
+    build_rope_perm,
+    padded_attn_mask,
+    padded_sdpa,
+)
 
 logger = init_logger(__name__)
 
@@ -273,10 +279,12 @@ def _rope_swap_matrix(dim: int, dtype: torch.dtype, device: torch.device) -> tor
     key = (dim, dtype, str(device))
     swap = _ROPE_SWAP.get(key)
     if swap is None:
-        half = dim // 2
-        rows = torch.cat([torch.arange(half, dim), torch.arange(0, half)])
-        swap = torch.zeros(dim, dim, dtype=dtype)
-        swap[rows, torch.arange(dim)] = 1.0
+        if torch.compiler.is_compiling():
+            raise RuntimeError(
+                f"rope swap {key} was not warmed; `Gemma4VisionEncoder.forward` warms it "
+                "before the layer loop and has to precede the first layer."
+            )
+        swap = build_rope_perm("half_swap", dim, dtype)
         if device.type != "cpu":
             swap = convert(swap, device=device, dtype=dtype)
         _ROPE_SWAP[key] = swap

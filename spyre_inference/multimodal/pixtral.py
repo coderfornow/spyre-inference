@@ -26,7 +26,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import padded_attn_mask, padded_sdpa
+from spyre_inference.multimodal.utils import build_rope_perm, padded_attn_mask, padded_sdpa
 
 logger = init_logger(__name__)
 
@@ -44,17 +44,20 @@ def rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Te
     Memoised in a plain dict, not `@cache`: Dynamo inlines the wrapped function, so a
     compiled block would re-trace the host assembly below. A dict read with a constant
     key folds at trace time instead, provided `warm_rope_perm` filled the entry first.
+    A permutation that genuinely cannot be warmed goes through the
+    `spyre_inference::rope_perm_matrix` op instead.
     """
-    if kind != "pair":
-        raise ValueError(f"unknown rope permutation kind {kind!r}")
     key = (kind, head_dim, str(device))
     m = _ROPE_PERMS.get(key)
     if m is None:
-        m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
-        even = torch.arange(0, head_dim, 2)
-        m[even, even + 1] = 1.0
-        m[even + 1, even] = 1.0
-        m = convert(m, device=device, dtype=torch.float16)
+        if torch.compiler.is_compiling():
+            raise RuntimeError(
+                f"rope permutation {key} was not warmed; `warm_rope_perm` runs from "
+                "`apply()` at load time and has to precede the first forward."
+            )
+        m = convert(
+            build_rope_perm(kind, head_dim, torch.float16), device=device, dtype=torch.float16
+        )
         _ROPE_PERMS[key] = m
     return m
 

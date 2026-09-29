@@ -176,6 +176,15 @@ whose blocks a multimodal patch forced onto the host (BLIP-2's Q-Former, and wit
 Granite 4's projectors), which cannot trace under `fullgraph=True`. A model matching
 nothing falls back to a whole-model graph.
 
+A block cannot assemble a constant on the host: a CPU-resident buffer has no device
+layout, and layout propagation rejects the graph. Vision towers therefore build their
+rope permutations and attention masks once outside the layer loop and read them from a
+cache inside it; reading an entry nobody warmed raises a message naming the warm call,
+rather than failing later inside Inductor. A constant no warm call can reach — one whose
+shape is only known inside a compiled region — goes through the
+`spyre_inference::rope_perm_matrix` op instead, which hides the host build in one opaque
+node at the cost of a fallback node per call site.
+
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
 backend compile count is independent of depth, but it is not 1: layer 0 specializes

@@ -260,6 +260,19 @@ def test_warm_rope_perm_fills_the_cache_before_any_block_runs(tp_group):
 
 
 @pytest.mark.pixtral
+def test_unwarmed_rope_perm_raises_while_tracing(monkeypatch):
+    """Skipping the warm call used to surface as a layout error from inside inductor,
+    naming a buffer instead of the missing call. It fails here, at the read."""
+    from spyre_inference.multimodal import pixtral as spyre_pixtral
+
+    spyre_pixtral._ROPE_PERMS.clear()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    with pytest.raises(RuntimeError, match="warm_rope_perm"):
+        spyre_pixtral.rope_perm_matrix("pair", HEAD_DIM, torch.device("cpu"))
+
+
+@pytest.mark.pixtral
 def test_warmed_rope_perm_is_a_graph_input_not_host_work():
     """What the warm-up buys, stated as a trace: the rope compiles to a matmul against
     a tensor it was handed. `@cache` does not -- Dynamo ignores the wrapper and inlines
@@ -282,6 +295,7 @@ def test_warmed_rope_perm_is_a_graph_input_not_host_work():
         x, x, freqs_cis
     )
 
+    assert graphs, "nothing was traced, so the assertions below would prove nothing"
     targets = {n.target for n in graphs[0].graph.nodes if n.op == "call_function"}
     assert torch.matmul in targets, "the rotation itself must be in the graph"
     assert not targets & {torch.zeros, torch.arange}, (

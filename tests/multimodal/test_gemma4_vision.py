@@ -368,6 +368,19 @@ def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
     torch.testing.assert_close(got, want)
 
 
+def test_unwarmed_rope_swap_raises_while_tracing(monkeypatch):
+    """The encoder forward warms the swap before the layer loop. Without it the build
+    lands inside a compiled layer, which used to die as a layout error deep in
+    inductor rather than naming the site that should have warmed it."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision._ROPE_SWAP.clear()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    with pytest.raises(RuntimeError, match="Gemma4VisionEncoder.forward"):
+        gemma4_vision._rope_swap_matrix(64, torch.float16, torch.device("cpu"))
+
+
 # ---------------------------------------------------------------------------
 # Patch application / dispatch
 # ---------------------------------------------------------------------------
