@@ -39,6 +39,7 @@ STOCK_ENCODER_FORWARD = modeling_gemma4.Gemma4VisionEncoder.forward
 # test changes every later one in the process.
 _PATCHED_ATTRS = [
     (modeling_gemma4.Gemma4RMSNorm, "forward"),
+    (modeling_gemma4.Gemma4VisionAttention, "forward"),
     (modeling_gemma4.Gemma4VisionEncoder, "forward"),
     (modeling_gemma4.Gemma4VisionPooler, "forward"),
     (modeling_gemma4.Gemma4VisionPatchEmbedder, "_position_embeddings"),
@@ -367,6 +368,19 @@ def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
     torch.testing.assert_close(got, want)
 
 
+def test_unwarmed_rope_swap_raises_while_tracing(monkeypatch):
+    """The encoder forward warms the swap before the layer loop. Without it the build
+    lands inside a compiled layer, which used to die as a layout error deep in
+    inductor rather than naming the site that should have warmed it."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision._ROPE_SWAP.clear()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    with pytest.raises(RuntimeError, match="Gemma4VisionEncoder.forward"):
+        gemma4_vision._rope_swap_matrix(64, torch.float16, torch.device("cpu"))
+
+
 # ---------------------------------------------------------------------------
 # Patch application / dispatch
 # ---------------------------------------------------------------------------
@@ -380,6 +394,11 @@ def test_patches_are_idempotent():
     first = modeling_gemma4.Gemma4RMSNorm.forward
     gemma4_vision.patch_rms_norm()
     assert modeling_gemma4.Gemma4RMSNorm.forward is first
+
+    gemma4_vision.patch_vision_attention()
+    first_attention = modeling_gemma4.Gemma4VisionAttention.forward
+    gemma4_vision.patch_vision_attention()
+    assert modeling_gemma4.Gemma4VisionAttention.forward is first_attention
 
     gemma4_vision.patch_vision_encoder()
     first_encoder = modeling_gemma4.Gemma4VisionEncoder.forward
@@ -867,6 +886,7 @@ def test_patched_encoder_forward_matches_stock(valid):
             copy.deepcopy(encoder), embeds, mask, pixel_position_ids=pos
         ).last_hidden_state
 
+    gemma4_vision.patch_vision_attention()
     gemma4_vision.patch_vision_encoder()
     gemma4_vision.patch_rms_norm()
     _pad(encoder)
@@ -878,6 +898,30 @@ def test_patched_encoder_forward_matches_stock(valid):
         actual.flatten(), expected.flatten(), dim=0
     ).item()
     assert cosine > 0.999, f"cosine {cosine}"
+
+
+def test_layers_stay_the_per_block_compile_unit():
+    """`_compile_blocks` wraps each layer in place, which only bites if the patched
+    encoder still goes through `layer.__call__` instead of inlining the layer body."""
+    from spyre_inference.multimodal import gemma4_vision
+    from spyre_inference.v1.worker.spyre_model_runner import _repeated_block_lists
+
+    encoder = _encoder()
+    assert _repeated_block_lists(encoder) == [encoder.layers]
+
+    gemma4_vision.patch_vision_attention()
+    gemma4_vision.patch_vision_encoder()
+    _pad(encoder)
+
+    called: list[int] = []
+    for i, layer in enumerate(encoder.layers):
+        layer.register_forward_hook(lambda *_, i=i: called.append(i))
+
+    embeds, mask, pos = _encoder_inputs()
+    with torch.inference_mode():
+        encoder(embeds, mask, pixel_position_ids=pos)
+
+    assert called == list(range(len(encoder.layers)))
 
 
 def test_patched_encoder_rejects_a_batch_mixing_valid_patch_counts():

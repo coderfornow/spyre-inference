@@ -165,12 +165,25 @@ are bucketed independently: the packed `num_tokens` for the block graph (below) 
 `(num_blocks, query_len)` for attention (see [Attention Backend](#attention-backend)).
 
 Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entries own an
-`Attention` somewhere, and are not themselves `Attention` layers — so decoder stacks
-(`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
-hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
-`Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack.
-Models whose attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi), vision-tower
-attention — match nothing and fall back to a whole-model graph.
+attention layer somewhere, and are not themselves attention layers — so decoder stacks
+(`model.layers`), encoder stacks (`bert.encoder.layer`) and vision towers
+(`vision_encoder.transformer.layers`) are all covered, as are hybrid Mamba+attention
+stacks that mix layer classes in one list. Attention means an `AttentionLayerBase`, an
+`MMEncoderAttention`, or any class whose name ends in `Attention` — a tower's own
+attention is typically none of vLLM's layers. Two kinds of list are skipped: one of bare
+`Attention` layers (Zamba2's shared `dpa_list`), which is not a block stack, and one
+whose blocks a multimodal patch forced onto the host (BLIP-2's Q-Former, and with it
+Granite 4's projectors), which cannot trace under `fullgraph=True`. A model matching
+nothing falls back to a whole-model graph.
+
+A block cannot assemble a constant on the host: a CPU-resident buffer has no device
+layout, and layout propagation rejects the graph. Vision towers therefore build their
+rope permutations and attention masks once outside the layer loop and read them from a
+cache inside it; reading an entry nobody warmed raises a message naming the warm call,
+rather than failing later inside Inductor. A constant no warm call can reach — one whose
+shape is only known inside a compiled region — goes through the
+`spyre_inference::rope_perm_matrix` op instead, which hides the host build in one opaque
+node at the cost of a fallback node per call site.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The

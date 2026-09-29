@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from spyre_inference.v1.worker.spyre_model_runner import (
     TorchSpyreModelRunner,
-    _is_decoder_attention_like,
+    _is_attention_like,
     _repeated_block_lists,
 )
 
@@ -62,24 +62,23 @@ def _fake_attention() -> Attention:
     return attn
 
 
-def _hf_decoder_attention(implementation: str = "vllm", layer_idx: int = 0) -> nn.Module:
+def _hf_decoder_attention(layer_idx: int = 0) -> nn.Module:
     """HF dispatcher that TransformersForCausalLM points at vLLM KV-cache attention."""
 
     class GraniteAttention(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.layer_idx = layer_idx
-            self.config = types.SimpleNamespace(_attn_implementation=implementation)
             self.q_proj = nn.Linear(4, 4)
 
     return GraniteAttention()
 
 
-def _hf_decoder_stack(implementation: str = "vllm") -> nn.Module:
+def _hf_decoder_stack() -> nn.Module:
     class GraniteDecoderLayer(nn.Module):
         def __init__(self):
             super().__init__()
-            self.self_attn = _hf_decoder_attention(implementation)
+            self.self_attn = _hf_decoder_attention()
 
     class GraniteModel(nn.Module):
         def __init__(self):
@@ -217,67 +216,36 @@ def test_finds_heterogeneous_hybrid_stacks() -> None:
     assert _repeated_block_lists(model) == [model.model.layers]
 
 
-def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
-    native = _fake_attention()
-    assert _is_decoder_attention_like(native)
+def test_attention_like_accepts_vllm_layers_and_tower_attention() -> None:
+    """A tower's attention is its own class, so the name is part of the contract."""
+    assert _is_attention_like(_fake_attention())
 
     hf = _hf_decoder_attention()
     assert not isinstance(hf, Attention)
-    assert _is_decoder_attention_like(hf)
-    assert _is_decoder_attention_like(_hf_decoder_attention("paged|vllm"))
+    assert _is_attention_like(hf)
 
-    class GraniteAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer_idx = 0
-            self.config = types.SimpleNamespace(_attn_implementation="sdpa")
-            self.q_proj = nn.Linear(4, 4)
+    class SiglipAttention(nn.Module):
+        pass
 
-    assert not _is_decoder_attention_like(GraniteAttention())
+    assert _is_attention_like(SiglipAttention())
+    assert not _is_attention_like(nn.Linear(4, 4))
 
 
-@pytest.mark.parametrize("implementation", ["vllm", "paged|vllm"])
-def test_finds_blocks_with_hf_decoder_kv_cache_attention(implementation: str) -> None:
-    """TransformersForCausalLM keeps HF layers and sets ``_attn_implementation`` to vLLM.
+def test_finds_blocks_with_hf_decoder_attention() -> None:
+    """TransformersForCausalLM keeps HF layers rather than vLLM ``Attention`` ones.
 
-    ``test_transformers_backend_compile`` only asserts tokens. Dropping this
-    dispatch check still compiles the whole model and would pass; discovery here
-    is the signal.
+    ``test_transformers_backend_compile`` only asserts tokens. Missing these layers
+    still compiles the whole model and would pass; discovery here is the signal.
     """
-    model = _hf_decoder_stack(implementation)
+    model = _hf_decoder_stack()
     assert not isinstance(model.layers[0].self_attn, Attention)
     assert _repeated_block_lists(model) == [model.layers]
 
 
-def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
-    """Class name ``*Attention`` is not enough; vision towers keep ``sdpa``."""
-
-    class GraniteAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.q_proj = nn.Linear(4, 4)
-
-    class GraniteDecoderLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.self_attn = GraniteAttention()
-
-    class GraniteModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layers = nn.ModuleList([GraniteDecoderLayer() for _ in range(3)])
-
-    assert _repeated_block_lists(GraniteModel()) == []
-    sdpa = _hf_decoder_stack("sdpa")
-    assert _repeated_block_lists(sdpa) == []
-
-
-def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
+def test_finds_pixtral_vision_blocks() -> None:
     """Pixtral's tower uses a local ``class Attention`` and ``MMEncoderAttention``.
 
-    Those keep HF ``sdpa`` (or no vLLM dispatch at all), so they are not decoder
-    KV-cache attention. Wrapping them traces RoPE+SDPA graphs that coarse-tile
-    cannot lower (``hint_id`` split across nests).
+    Neither is a vLLM layer, so the tower is discovered by class name alone.
     """
 
     class Attention(nn.Module):
@@ -306,46 +274,50 @@ def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
             super().__init__()
             self.vision_encoder = VisionTransformer()
 
-    class PixtralHFAttention(nn.Module):
+    model = Pixtral()
+    assert _repeated_block_lists(model) == [model.vision_encoder.layers]
+
+
+def test_skips_blocks_a_multimodal_patch_moved_to_the_host() -> None:
+    """blip2's Q-Former forward does a device round trip, so no fullgraph block fits.
+
+    The marker sits on the attention class, which is why granite 4's projector list --
+    an outer ``ModuleList`` that merely nests a Q-Former -- is skipped with it.
+    """
+
+    class Blip2QFormerMultiHeadAttention(nn.Module):
+        _spyre_runs_on_host = True
+
+    class QFormerLayer(nn.Module):
         def __init__(self):
             super().__init__()
-            self.layer_idx = 0
-            self.config = types.SimpleNamespace(_attn_implementation="sdpa")
-            self.q_proj = nn.Linear(4, 4)
+            self.attention = Blip2QFormerMultiHeadAttention()
 
-    class PixtralHFBlock(nn.Module):
+    class Projector(nn.Module):
         def __init__(self):
             super().__init__()
-            self.self_attn = PixtralHFAttention()
+            self.layer = nn.ModuleList([QFormerLayer() for _ in range(2)])
 
-    class PixtralHF(nn.Module):
+    class Granite4Vision(nn.Module):
         def __init__(self):
             super().__init__()
-            # No vision_* path segment: decoder-attention dispatch must be enough.
-            self.layers = nn.ModuleList([PixtralHFBlock() for _ in range(2)])
+            self.layerwise_projectors = nn.ModuleList([Projector() for _ in range(2)])
 
-    assert _repeated_block_lists(Pixtral()) == []
-    assert _repeated_block_lists(PixtralHF()) == []
+    assert _repeated_block_lists(Granite4Vision()) == []
 
 
-def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
-    """Ministral-style VLM: decoder KV-cache attention compiles; vision stays eager."""
+def test_vlm_compiles_both_vision_and_decoder_blocks() -> None:
+    """Ministral-style VLM: the tower compiles on the same path as the decoder."""
 
     class Attention(nn.Module):
         def __init__(self):
             super().__init__()
             self.qkv = nn.Linear(4, 4)
 
-    class MMEncoderAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.scale = 1.0
-
     class VisionBlock(nn.Module):
         def __init__(self):
             super().__init__()
             self.attention = Attention()
-            self.attn = MMEncoderAttention()
 
     class DecoderLayer(nn.Module):
         def __init__(self):
@@ -366,11 +338,10 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     model = VLM()
     vision_layers = model.vision_encoder.transformer.layers
     decoder_layers = model.language_model.layers
-    assert _repeated_block_lists(model) == [decoder_layers]
+    assert _repeated_block_lists(model) == [vision_layers, decoder_layers]
 
-    originals = list(vision_layers)
-    assert _runner(model)._compile_blocks() == 3
-    assert all(block._compiled_call_impl is None for block in originals)
+    assert _runner(model)._compile_blocks() == 5
+    assert all(block._compiled_call_impl is not None for block in vision_layers)
     assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
 
 
@@ -446,7 +417,7 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
 
 
 def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None:
-    """The path every MLA and vision-tower model takes."""
+    """A model with no block stack at all still compiles, as one graph."""
     compiled: list[nn.Module] = []
     monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
 
