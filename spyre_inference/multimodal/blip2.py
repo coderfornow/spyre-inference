@@ -71,6 +71,9 @@ def patch_blip2_qformer_attention() -> None:
 
     _blip2_attn_forward_cpu._spyre_patched = True  # type: ignore[attr-defined]
     Blip2QFormerMultiHeadAttention.forward = _blip2_attn_forward_cpu  # type: ignore[method-assign]
+    # Moving itself between devices mid-forward is untraceable, so the runner must keep
+    # every enclosing block list out of per-block compile.
+    Blip2QFormerMultiHeadAttention._spyre_runs_on_host = True
     logger.info(
         "Spyre: patched Blip2QFormerMultiHeadAttention.forward to run on CPU "
         "(permute/matmul chains not restickifiable on Spyre)."

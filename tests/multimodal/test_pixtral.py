@@ -755,6 +755,57 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
 
 
 @pytest.mark.pixtral
+def test_compiled_vision_attention_matches_cpu_on_spyre(tp_group):
+    """The patched vision attention must also survive `torch.compile`.
+
+    `_compile_blocks` wraps every `TransformerBlock` of the tower, so the rope +
+    `padded_sdpa` rewrite is traced rather than dispatched op by op. It used to die in
+    coarse-tile with `hint_id=N appears in both group 0 and group 1`, which is why
+    vision towers were kept out of per-block compile.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.multimodal.pixtral import (
+        patch_vision_attention,
+        patch_vision_rope_vit,
+        rope_perm_matrix,
+    )
+
+    num_patches = 64
+    args = _vision_args()
+    layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
+    torch.manual_seed(31)
+    for param in layer.parameters():
+        param.data.normal_(std=0.02)
+    _finish_weight_loading(layer)
+
+    patch_vision_rope_vit()
+    patch_vision_attention()
+
+    positions = _positions(num_patches)
+    table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
+    freqs_cis = table[(positions[:, 0], positions[:, 1])]
+
+    torch.manual_seed(37)
+    x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
+    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+
+    expected = pixtral.Attention.forward(layer, x, _tower_mask(mask, num_patches), freqs_cis)
+
+    device = torch.device("spyre")
+    layer = layer.to(device)
+    # What `apply()` does through `warm_rope_perm`, off the same tensors the trace
+    # will see: an entry built inside the block is host work no lowering accepts.
+    rope_perm_matrix("pair", layer.head_dim, next(layer.parameters()).device)
+    layer.compile(backend="inductor", fullgraph=True, dynamic=False)
+    actual = layer(x.to(device), _tower_mask(mask, num_patches, device), freqs_cis.to(device))
+
+    assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.pixtral
 @pytest.mark.parametrize("image_size", [(4, 4), (6, 8)])
 def test_patch_merger_matches_cpu_on_spyre(tp_group, image_size):
     """The patched merger on-card must equal the same forward on CPU.
