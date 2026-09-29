@@ -21,33 +21,42 @@ monkeypatch and `apply()` is the only entry point.
 
 from __future__ import annotations
 
-from functools import cache
-
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import padded_sdpa
+from spyre_inference.multimodal.utils import padded_attn_mask, padded_sdpa
 
 logger = init_logger(__name__)
 
 
-@cache
+_ROPE_PERMS: dict[tuple[str, int, str], torch.Tensor] = {}
+
+
 def rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Tensor:
     """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.
 
     Rotating by a full-width matmul avoids slicing the head into `d/2`-wide halves:
     at head_dim=64 that half is 32, which torch-spyre cannot lay out ("Unexpected
     stick expression ... Mod(var, 32)"). kind="pair" swaps each `(2k, 2k+1)` pair.
+
+    Memoised in a plain dict, not `@cache`: Dynamo inlines the wrapped function, so a
+    compiled block would re-trace the host assembly below. A dict read with a constant
+    key folds at trace time instead, provided `warm_rope_perm` filled the entry first.
     """
     if kind != "pair":
         raise ValueError(f"unknown rope permutation kind {kind!r}")
-    m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
-    even = torch.arange(0, head_dim, 2)
-    m[even, even + 1] = 1.0
-    m[even + 1, even] = 1.0
-    return convert(m, device=device, dtype=torch.float16)
+    key = (kind, head_dim, str(device))
+    m = _ROPE_PERMS.get(key)
+    if m is None:
+        m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
+        even = torch.arange(0, head_dim, 2)
+        m[even, even + 1] = 1.0
+        m[even + 1, even] = 1.0
+        m = convert(m, device=device, dtype=torch.float16)
+        _ROPE_PERMS[key] = m
+    return m
 
 
 def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
@@ -96,6 +105,33 @@ def patch_vision_attention() -> None:
         "Spyre: patched Pixtral vision Attention to stick-aligned padded "
         "on-card SDPA (pad L/D to 64, mask, crop)."
     )
+
+
+def patch_transformer_mask() -> None:
+    """Pad Pixtral's block-diagonal mask once per image, outside the layer loop.
+
+    Upstream hands every layer the raw `[1, 1, patches, patches]` host mask. Padding it
+    here makes it a device tensor the blocks only read, so no block reaches the host.
+    """
+    try:
+        from vllm.model_executor.models import pixtral
+    except ImportError:
+        return
+
+    cls = getattr(pixtral, "Transformer", None)
+    if cls is None or getattr(cls.forward, "_spyre_patched", False):
+        return
+
+    def _forward(self, x, mask, freqs_cis):
+        batch, patches, _ = x.shape
+        mask = padded_attn_mask(mask, batch, patches, x.dtype, x.device)
+        for layer in self.layers:
+            x = layer(x, mask=mask, freqs_cis=freqs_cis)
+        return x
+
+    _forward._spyre_patched = True
+    cls.forward = _forward
+    logger.info("Spyre: Pixtral vision mask padded once per image instead of once per layer.")
 
 
 def patch_vision_rope_vit() -> None:
@@ -260,15 +296,29 @@ def patch_pre_transformer_norm(model: nn.Module) -> None:
     logger.info("Spyre: Pixtral pre-transformer norm input uses the default device layout.")
 
 
+def warm_rope_perm(model: nn.Module) -> None:
+    """Build the tower's rope permutation before any layer is traced.
+
+    Assembling it is host work, which a compiled block has no device layout to lower.
+    """
+    tower = getattr(model, "vision_encoder", None) or getattr(model, "vision_tower", None)
+    transformer = getattr(tower, "transformer", None)
+    if transformer is None:
+        return
+    for layer in transformer.layers:
+        attn = layer.attention
+        rope_perm_matrix("pair", attn.head_dim, next(attn.parameters()).device)
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Pixtral vision-tower workaround, in dependency order.
 
     The patch-embedding conv is absent on purpose: `SpyreConv2d` in
     `custom_ops/conv.py` handles it through OOT dispatch.
 
-    `model` and `device` are unused: every remaining patch rewrites upstream module
-    attributes rather than a loaded instance. They stay for the `apply(model, device)`
-    contract the sibling architecture modules share.
+    `device` is unused: the steps that touch the loaded instance read it off the tower,
+    which the runner has already moved. It stays for the `apply(model, device)` contract
+    the sibling architecture modules share.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -285,6 +335,8 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
     patch_vision_rope_vit()
     patch_vision_attention()
+    patch_transformer_mask()
     patch_block_attention_mask()
     patch_patch_merger()
     patch_pre_transformer_norm(model)
+    warm_rope_perm(model)

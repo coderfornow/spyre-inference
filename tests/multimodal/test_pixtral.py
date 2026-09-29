@@ -55,6 +55,7 @@ def restore_pixtral(monkeypatch):
     """Undo the patches after each test: they mutate the shared `pixtral` module,
     and one test would otherwise leak a patched tower into the whole session."""
     monkeypatch.setattr(pixtral, "apply_rotary_emb_vit", pixtral.apply_rotary_emb_vit)
+    monkeypatch.setattr(pixtral.Transformer, "forward", pixtral.Transformer.forward)
     monkeypatch.setattr(
         pixtral.VisionTransformer, "freqs_cis", pixtral.VisionTransformer.__dict__["freqs_cis"]
     )
@@ -69,6 +70,13 @@ def restore_pixtral(monkeypatch):
         modeling_pixtral.generate_block_attention_mask,
     )
     yield
+
+
+def _tower_mask(mask: torch.Tensor, num_patches: int, device: str = "cpu") -> torch.Tensor:
+    """The padded additive mask the patched `Transformer.forward` hands each block."""
+    from spyre_inference.multimodal.utils import padded_attn_mask
+
+    return padded_attn_mask(mask, 1, num_patches, torch.float16, torch.device(device))
 
 
 def _vision_args(spatial_merge_size: int = 1):
@@ -145,6 +153,7 @@ def test_rope_rotate_matmul_matches_rotation_formula(head_dim):
         "apply_rotary_emb_vit",
         "precompute_freqs_cis_2d",
         "VisionTransformer",
+        "Transformer",
         "Attention",
         "PatchMerger",
     ],
@@ -183,6 +192,101 @@ def test_vision_attention_patch_is_applied_and_idempotent():
 
     patch_vision_attention()
     assert pixtral.Attention.forward is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_transformer_mask_patch_is_applied_and_idempotent():
+    from spyre_inference.multimodal.pixtral import patch_transformer_mask
+
+    patch_transformer_mask()
+    patched = pixtral.Transformer.forward
+    assert getattr(patched, "_spyre_patched", False) is True
+
+    patch_transformer_mask()
+    assert pixtral.Transformer.forward is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_transformer_hands_every_block_the_same_padded_mask():
+    """The hoist is what keeps host work out of a block: the mask must arrive padded
+    and device-resident, built once, rather than assembled inside each block."""
+    from spyre_inference.multimodal.pixtral import patch_transformer_mask
+
+    patch_transformer_mask()
+
+    seen: list[torch.Tensor] = []
+
+    class _Block(torch.nn.Module):
+        def forward(self, x, mask, freqs_cis):
+            seen.append(mask)
+            return x
+
+    transformer = torch.nn.Module()
+    transformer.layers = torch.nn.ModuleList([_Block() for _ in range(3)])
+
+    num_patches = 67
+    x = torch.zeros(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
+    source = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+    pixtral.Transformer.forward(transformer, x, source, None)
+
+    assert len(seen) == 3
+    assert all(m is seen[0] for m in seen)
+    assert seen[0].shape == (1, 1, 128, 128)
+
+
+@pytest.mark.pixtral
+def test_warm_rope_perm_fills_the_cache_before_any_block_runs(tp_group):
+    """A layer that builds its own rotation matrix builds it on the host. Warming the
+    cache up front leaves the traced body a dict read the tower's device already backs."""
+    from spyre_inference.multimodal import pixtral as spyre_pixtral
+
+    args = _vision_args()
+    model = torch.nn.Module()
+    model.vision_encoder = torch.nn.Module()
+    model.vision_encoder.transformer = torch.nn.Module()
+    model.vision_encoder.transformer.layers = torch.nn.ModuleList(
+        [pixtral.TransformerBlock(args, disable_tp=True) for _ in range(2)]
+    )
+
+    spyre_pixtral._ROPE_PERMS.clear()
+    spyre_pixtral.warm_rope_perm(model)
+
+    key = ("pair", HEAD_DIM, "cpu")
+    assert spyre_pixtral._ROPE_PERMS[key].shape == (HEAD_DIM, HEAD_DIM)
+    assert (
+        spyre_pixtral.rope_perm_matrix("pair", HEAD_DIM, torch.device("cpu"))
+        is spyre_pixtral._ROPE_PERMS[key]
+    ), "a later call must reuse the warmed entry, not rebuild it"
+
+
+@pytest.mark.pixtral
+def test_warmed_rope_perm_is_a_graph_input_not_host_work():
+    """What the warm-up buys, stated as a trace: the rope compiles to a matmul against
+    a tensor it was handed. `@cache` does not -- Dynamo ignores the wrapper and inlines
+    the build, so the graph would carry host `zeros`/`arange` a device cannot lower."""
+    from spyre_inference.multimodal import pixtral as spyre_pixtral
+
+    spyre_pixtral.patch_vision_rope_vit()
+    spyre_pixtral.rope_perm_matrix("pair", HEAD_DIM, torch.device("cpu"))
+
+    graphs = []
+
+    def capture(gm, _example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    x = torch.randn(1, 8, NUM_HEADS, HEAD_DIM, dtype=torch.float16)
+    freqs_cis = torch.randn(8, 2, HEAD_DIM, dtype=torch.float16)
+    torch._dynamo.reset()
+    torch.compile(pixtral.apply_rotary_emb_vit, backend=capture, fullgraph=True, dynamic=False)(
+        x, x, freqs_cis
+    )
+
+    targets = {n.target for n in graphs[0].graph.nodes if n.op == "call_function"}
+    assert torch.matmul in targets, "the rotation itself must be in the graph"
+    assert not targets & {torch.zeros, torch.arange}, (
+        "the permutation must arrive as a graph input, not be assembled inside the trace"
+    )
 
 
 @pytest.mark.pixtral
@@ -446,7 +550,7 @@ def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind)
     expected = layer.forward(x, mask, freqs_cis)
 
     patch_vision_attention()
-    actual = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    actual = pixtral.Attention.forward(layer, x, _tower_mask(mask, num_patches), freqs_cis)
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
@@ -459,28 +563,28 @@ def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind)
 
 @pytest.mark.pixtral
 def test_padded_mask_is_cached_across_layers():
-    """The tower hands all 24 layers the same mask object; the O(L²) padded mask
-    must be built and uploaded once, not per layer."""
-    from spyre_inference.multimodal.utils import _padded_attn_mask
+    """A multi-image batch hands the same mask object to the tower repeatedly; the
+    O(L²) padded mask must be built and uploaded once, not per call."""
+    from spyre_inference.multimodal.utils import padded_attn_mask
 
     mask = torch.ones(67, 67, dtype=torch.bool).tril()
-    args = (mask, 1, 67, 128, torch.float16, torch.device("cpu"))
+    args = (mask, 1, 67, torch.float16, torch.device("cpu"))
 
-    first = _padded_attn_mask(*args)
-    assert all(_padded_attn_mask(*args) is first for _ in range(23))
+    first = padded_attn_mask(*args)
+    assert all(padded_attn_mask(*args) is first for _ in range(23))
 
 
 @pytest.mark.pixtral
 def test_padded_mask_cache_misses_on_a_new_mask():
     """A second image brings a new mask object — the cache must not serve the
     previous image's mask."""
-    from spyre_inference.multimodal.utils import _padded_attn_mask
+    from spyre_inference.multimodal.utils import padded_attn_mask
 
     tril = torch.ones(67, 67, dtype=torch.bool).tril()
-    first = _padded_attn_mask(tril, 1, 67, 128, torch.float16, torch.device("cpu"))
+    first = padded_attn_mask(tril, 1, 67, torch.float16, torch.device("cpu"))
 
     triu = torch.ones(67, 67, dtype=torch.bool).triu()
-    second = _padded_attn_mask(triu, 1, 67, 128, torch.float16, torch.device("cpu"))
+    second = padded_attn_mask(triu, 1, 67, torch.float16, torch.device("cpu"))
 
     assert second is not first
     assert not torch.equal(second, first)
@@ -493,10 +597,10 @@ def test_padded_mask_is_released_with_its_source_mask():
     import gc
     import weakref
 
-    from spyre_inference.multimodal.utils import _padded_attn_mask
+    from spyre_inference.multimodal.utils import padded_attn_mask
 
     mask = torch.ones(67, 67, dtype=torch.bool).tril()
-    padded = weakref.ref(_padded_attn_mask(mask, 1, 67, 128, torch.float16, torch.device("cpu")))
+    padded = weakref.ref(padded_attn_mask(mask, 1, 67, torch.float16, torch.device("cpu")))
     assert padded() is not None
 
     del mask
@@ -509,10 +613,10 @@ def test_padded_mask_is_released_with_its_source_mask():
 def test_padded_keys_are_masked_off(seq, seq_pad):
     """Padded key columns must be `-inf` and real ones must stay unmasked; a
     full-attention source mask (all-zero) must not add masking of its own."""
-    from spyre_inference.multimodal.utils import _padded_attn_mask
+    from spyre_inference.multimodal.utils import padded_attn_mask
 
     source = torch.zeros(seq, seq, dtype=torch.float16)
-    m = _padded_attn_mask(source, 1, seq, seq_pad, torch.float16, torch.device("cpu"))
+    m = padded_attn_mask(source, 1, seq, torch.float16, torch.device("cpu"))
 
     assert m.shape == (1, 1, seq_pad, seq_pad)
     neg_inf = torch.finfo(torch.float16).min
@@ -634,14 +738,17 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
 
     torch.manual_seed(37)
     x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
-    # Kept on CPU: the padded mask is assembled host-side and Spyre has no bool.
+    # Assembled host-side (Spyre has no bool), then uploaded once as `Transformer.forward`
+    # does -- a block that reached the host for it could not be compiled.
     mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
 
-    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    expected = pixtral.Attention.forward(layer, x, _tower_mask(mask, num_patches), freqs_cis)
 
     device = torch.device("spyre")
     layer = layer.to(device)
-    actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_cis.to(device))
+    actual = pixtral.Attention.forward(
+        layer, x.to(device), _tower_mask(mask, num_patches, device), freqs_cis.to(device)
+    )
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

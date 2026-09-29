@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa
+from spyre_inference.multimodal.utils import STICK, align_up, padded_attn_mask, padded_sdpa
 
 logger = init_logger(__name__)
 
@@ -494,7 +494,17 @@ def patch_vision_encoder() -> None:
                 "Gemma 4 vision needs one key-validity mask shared by the whole batch "
                 "on Spyre; this batch mixes valid-patch counts per row."
             )
-        attn_mask = mask_host[0].bool().unsqueeze(0).expand(seq_len, seq_len)
+        # Padded here rather than inside every layer's `padded_sdpa`: a host tensor
+        # reaching a compiled block has no device layout to lower.
+        attn_mask = padded_attn_mask(
+            mask_host[0].bool().unsqueeze(0).expand(seq_len, seq_len),
+            inputs_embeds.shape[0],
+            seq_len,
+            dtype,
+            device,
+        )
+        # Same reason: `_apply_rope` would otherwise assemble its permutation inside a layer.
+        _rope_swap_matrix(padded_head_dim, dtype, device)
 
         hidden_states = inputs_embeds
         for layer in self.layers[: config.num_hidden_layers]:
