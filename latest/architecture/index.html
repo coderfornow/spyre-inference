@@ -2664,7 +2664,7 @@ way.</p>
   (consistent tensor shapes for compilation)</li>
 <li><strong>Num-sequences bucketing</strong> (batched-decode kernel only, <code>SPYRE_BATCHED_DECODE=1</code>, the
   default; under the default tiled walk, the head-major layout only):
-  powers of two from 4 to <code>max_num_seqs</code> (<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>); the decode-batch
+  powers of two from 1 to <code>max_num_seqs</code> (<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>); the decode-batch
   kernel is recorded over the <code>(num_blocks, num_seqs)</code> grid</li>
 <li><strong>Head size</strong>: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)</li>
 <li><strong>Block size</strong>: Must be a multiple of 64. The default is 128, and a user-supplied
