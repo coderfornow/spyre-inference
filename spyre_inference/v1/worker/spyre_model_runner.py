@@ -1051,6 +1051,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         widths = [(modality, int(n)) for modality, n in max_items.items() if int(n) >= 1]
+        # Images only for a generative tower: an image item is one tower row of a fixed shape;
+        # a video or audio item expands to a frame or chunk count the request sets.
+        if self.model_config.runner_type != "pooling":
+            widths = [(modality, n) for modality, n in widths if modality == "image"]
         if not widths:
             return
         logger.info(

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import cache
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,37 @@ _BLOCK_COMPILABLE_ATTR = "_spyre_block_compilable"
 
 def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
+
+
+@cache
+def rope_perm_matrix(
+    kind: str, head_dim: int, device: torch.device, dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.
+
+    Rotating by a full-width matmul avoids slicing the head: at head_dim=64 a `d/2` slice
+    is 32 wide, which torch-spyre cannot lay out ("Unexpected stick expression ...
+    Mod(var, 32)"), and `cat`ing two slices of a matmul result is silently wrong on
+    device (uncorrelated data, no warning). kind="pair" swaps each `(2k, 2k+1)` pair;
+    kind="half" swaps the two halves, as `rotate_half` does.
+    """
+    m = torch.zeros(head_dim, head_dim, dtype=dtype)
+    if kind == "pair":
+        even = torch.arange(0, head_dim, 2)
+        m[even, even + 1] = 1.0
+        m[even + 1, even] = 1.0
+    elif kind == "half":
+        half = head_dim // 2
+        rows = torch.cat([torch.arange(half, head_dim), torch.arange(0, half)])
+        m[rows, torch.arange(head_dim)] = 1.0
+    else:
+        raise ValueError(f"unknown rope permutation kind {kind!r}")
+    return convert(m, device=device, dtype=dtype)
+
+
+def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
+    """`x*cos + (x @ m)*sin` — the rope rotation as a stick-aligned matmul."""
+    return x * cos + torch.matmul(x, m) * sin
 
 
 def mark_blocks_compilable(blocks: Iterable[nn.Module]) -> None:
@@ -138,11 +170,8 @@ def padded_sdpa(
     padded, or when the model carries its own scale.
 
     `mask=None` attends everywhere: only the padded keys are masked, and that path
-    is safe inside a compiled block.
-
-    A `mask` already in `_padded_attn_mask`'s form, over the batch or as one row that
-    broadcasts across it, is used as is, so a caller can pad it outside a compiled
-    block, where that function's attribute cache cannot live.
+    is safe inside a compiled block. An additive `mask` already padded to `seq_pad`
+    keys is used as is.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -172,15 +201,10 @@ def padded_sdpa(
             if seq == seq_pad
             else _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, q.dtype, device)]
         )
-    elif (
-        mask.shape[0] not in (1, b)
-        or mask.shape[1:] != (1, seq_pad, seq_pad)
-        or mask.dtype != q.dtype
-        or mask.device != device
-    ):
-        attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
-    else:
+    elif mask.shape[-1] == seq_pad and mask.dtype == q.dtype:
         attn_mask = mask
+    else:
+        attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(
         q,
         k,
