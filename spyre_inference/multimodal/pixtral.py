@@ -28,7 +28,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import padded_sdpa
+from spyre_inference.multimodal.utils import padded_attn_mask, padded_sdpa
 
 logger = init_logger(__name__)
 
@@ -85,6 +85,7 @@ def patch_vision_attention() -> None:
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        mask = padded_attn_mask(mask, batch, patches, x.dtype, x.device)
         out = padded_sdpa(q, k, v, mask)
         out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
         out, _ = self.o_proj(out)
@@ -177,7 +178,7 @@ def patch_block_attention_mask() -> None:
 
     Upstream zeroes one `[start:end, start:end]` sub-block per image on
     `patch_embeds.device`; with N images those are strided sub-block writes, which are
-    not stick-safe. `_padded_attn_mask` pulls the mask to CPU anyway.
+    not stick-safe. `padded_attn_mask` pulls the mask to CPU anyway.
     """
     try:
         from transformers.models.pixtral import modeling_pixtral

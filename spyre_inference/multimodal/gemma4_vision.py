@@ -30,7 +30,12 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa
+from spyre_inference.multimodal.utils import (
+    STICK,
+    align_up,
+    padded_attn_mask,
+    padded_sdpa,
+)
 
 logger = init_logger(__name__)
 
@@ -273,6 +278,11 @@ def _rope_swap_matrix(dim: int, dtype: torch.dtype, device: torch.device) -> tor
     key = (dim, dtype, str(device))
     swap = _ROPE_SWAP.get(key)
     if swap is None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError(
+                f"rope swap {key} was not warmed; `Gemma4VisionEncoder.forward` warms it "
+                "before the layer loop and has to precede the first layer."
+            )
         half = dim // 2
         rows = torch.cat([torch.arange(half, dim), torch.arange(0, half)])
         swap = torch.zeros(dim, dim, dtype=dtype)
@@ -372,63 +382,56 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     attn._spyre_padded_head_dim = padded_head_dim
 
 
-def _run_attention(
-    attn,
-    hidden_states: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    attn_mask: torch.Tensor,
-    num_heads: int,
-    orig_head_dim: int,
-    padded_head_dim: int,
-) -> torch.Tensor:
-    bsz, seq_len, _ = hidden_states.shape
+def patch_vision_attention() -> None:
+    """Replace `Gemma4VisionAttention.forward` with padded rope + `padded_sdpa`.
 
-    # Rope at [B, L, H, D], then transpose to [B, H, L, D] for SDPA -- Pixtral's own
-    # order (`multimodal/pixtral.py::patch_vision_attention`).
-    q = attn.q_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
-    q = _padded_rms_norm(q, attn.q_norm.weight, attn.q_norm.eps, orig_head_dim)
-    q = _apply_rope(q, cos, sin).transpose(1, 2)
-    k = attn.k_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
-    k = _padded_rms_norm(k, attn.k_norm.weight, attn.k_norm.eps, orig_head_dim)
-    k = _apply_rope(k, cos, sin).transpose(1, 2)
-    v = attn.v_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
-    v = _padded_rms_norm(v, None, attn.v_norm.eps, orig_head_dim).transpose(1, 2)
+    Patching the attention rather than inlining the whole layer leaves
+    `Gemma4VisionEncoderLayer.forward` stock, which is what lets the runner discover
+    the layer as a per-block compile unit.
+    """
+    try:
+        from transformers.models.gemma4 import modeling_gemma4
+    except ImportError:
+        return
 
-    attn_out = padded_sdpa(q, k, v, attn_mask, scale=float(attn.scaling))
-    attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-    return attn.o_proj(attn_out)
+    cls = getattr(modeling_gemma4, "Gemma4VisionAttention", None)
+    if cls is None or getattr(cls.forward, "_spyre_patched", False):
+        return
 
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        # cos/sin already carry the positions, so position_ids is redundant here.
+        del position_ids, kwargs
+        cos, sin = position_embeddings
+        bsz, seq_len, _ = hidden_states.shape
+        num_heads = self.config.num_attention_heads
+        orig_head_dim = self.head_dim
+        padded_head_dim = self._spyre_padded_head_dim
 
-def _run_layer(
-    layer,
-    hidden_states: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    attn_mask: torch.Tensor,
-    num_heads: int,
-    orig_head_dim: int,
-    padded_head_dim: int,
-) -> torch.Tensor:
-    residual = hidden_states
-    hidden_states = layer.input_layernorm(hidden_states)
-    attn_out = _run_attention(
-        layer.self_attn,
-        hidden_states,
-        cos,
-        sin,
-        attn_mask,
-        num_heads,
-        orig_head_dim,
-        padded_head_dim,
-    )
-    hidden_states = residual + layer.post_attention_layernorm(attn_out)
+        # Rope at [B, L, H, D], then transpose to [B, H, L, D] for SDPA -- Pixtral's own
+        # order (`multimodal/pixtral.py::patch_vision_attention`).
+        q = self.q_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
+        q = _padded_rms_norm(q, self.q_norm.weight, self.q_norm.eps, orig_head_dim)
+        q = _apply_rope(q, cos, sin).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
+        k = _padded_rms_norm(k, self.k_norm.weight, self.k_norm.eps, orig_head_dim)
+        k = _apply_rope(k, cos, sin).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
+        v = _padded_rms_norm(v, None, self.v_norm.eps, orig_head_dim).transpose(1, 2)
 
-    residual = hidden_states
-    hidden_states = layer.pre_feedforward_layernorm(hidden_states)
-    hidden_states = layer.mlp(hidden_states)
-    hidden_states = layer.post_feedforward_layernorm(hidden_states)
-    return residual + hidden_states
+        attn_out = padded_sdpa(q, k, v, attention_mask, scale=float(self.scaling))
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_out), None
+
+    _forward._spyre_patched = True
+    cls.forward = _forward
+    logger.info_once("Spyre: patched Gemma4VisionAttention to padded rope + padded SDPA.")
 
 
 def patch_vision_encoder() -> None:
@@ -436,8 +439,9 @@ def patch_vision_encoder() -> None:
 
     Three things in the stock forward do not lower: the mask built by
     `create_bidirectional_mask`, rope over a head_dim that is not stick-aligned, and
-    attention over a patch count coprime with the stick. So pad the head dim, rotate
-    with `_apply_rope`, and attend through `padded_sdpa`.
+    attention over a patch count coprime with the stick. The last two are handled per
+    layer by `patch_vision_attention`; this builds the mask and the rope tables on the
+    host, once per call rather than once per layer.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -465,9 +469,7 @@ def patch_vision_encoder() -> None:
         if pixel_position_ids is None:
             # Optional only to match the stock signature; every caller supplies it.
             raise NotImplementedError("Gemma 4 vision requires pixel_position_ids on Spyre.")
-        num_heads = config.num_attention_heads
-        orig_head_dim = config.head_dim
-        padded_head_dim = _padded_head_dim(orig_head_dim)
+        padded_head_dim = _padded_head_dim(config.head_dim)
 
         if getattr(self.layers[0].self_attn, "_spyre_padded_head_dim", None) != padded_head_dim:
             raise RuntimeError(
@@ -494,19 +496,24 @@ def patch_vision_encoder() -> None:
                 "Gemma 4 vision needs one key-validity mask shared by the whole batch "
                 "on Spyre; this batch mixes valid-patch counts per row."
             )
-        attn_mask = mask_host[0].bool().unsqueeze(0).expand(seq_len, seq_len)
+        # Padded here rather than inside every layer's `padded_sdpa`: a host tensor
+        # reaching a compiled block has no device layout to lower.
+        attn_mask = padded_attn_mask(
+            mask_host[0].bool().unsqueeze(0).expand(seq_len, seq_len),
+            inputs_embeds.shape[0],
+            seq_len,
+            dtype,
+            device,
+        )
+        # Same reason: `_apply_rope` would otherwise assemble its permutation inside a layer.
+        _rope_swap_matrix(padded_head_dim, dtype, device)
 
+        # The stock layer body is Spyre-safe once `patch_vision_attention` has replaced
+        # what it calls, and calling it keeps the layer a compile unit the runner finds.
         hidden_states = inputs_embeds
         for layer in self.layers[: config.num_hidden_layers]:
-            hidden_states = _run_layer(
-                layer,
-                hidden_states,
-                cos,
-                sin,
-                attn_mask,
-                num_heads,
-                orig_head_dim,
-                padded_head_dim,
+            hidden_states = layer(
+                hidden_states, position_embeddings=(cos, sin), attention_mask=attn_mask
             )
 
         from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -728,6 +735,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     patch_rms_norm()
     patch_patch_embedder()
     patch_pooler()
+    patch_vision_attention()
     patch_vision_encoder()
     pad_vision_weights(model)
     place_vision_tail_on_cpu(model)
