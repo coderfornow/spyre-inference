@@ -21,38 +21,14 @@ monkeypatch and `apply()` is the only entry point.
 
 from __future__ import annotations
 
-from functools import cache
-
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import padded_sdpa
+from spyre_inference.multimodal.utils import padded_sdpa, rope_perm_matrix, rope_rotate_matmul
 
 logger = init_logger(__name__)
-
-
-@cache
-def rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Tensor:
-    """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.
-
-    Rotating by a full-width matmul avoids slicing the head into `d/2`-wide halves:
-    at head_dim=64 that half is 32, which torch-spyre cannot lay out ("Unexpected
-    stick expression ... Mod(var, 32)"). kind="pair" swaps each `(2k, 2k+1)` pair.
-    """
-    if kind != "pair":
-        raise ValueError(f"unknown rope permutation kind {kind!r}")
-    m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
-    even = torch.arange(0, head_dim, 2)
-    m[even, even + 1] = 1.0
-    m[even + 1, even] = 1.0
-    return convert(m, device=device, dtype=torch.float16)
-
-
-def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
-    """`x*cos + (x @ m)*sin` — the rope rotation as a stick-aligned matmul."""
-    return x * cos + torch.matmul(x, m) * sin
 
 
 def patch_vision_attention() -> None:
