@@ -43,11 +43,9 @@ def padded_attn_mask(
 ) -> torch.Tensor:
     """The additive `[b, 1, seq_pad, seq_pad]` mask `padded_sdpa` expects, on `device`.
 
-    Callers build it once per image, outside their block loop: a host-resident tensor
-    reaching a compiled block has no device layout for torch-spyre to lower.
-
     O(L²) and shared by every layer, so it is cached on the source mask: one upload
-    per image, released with its source.
+    per image, released with its source. A compiled block must call this outside its
+    layer loop -- a host tensor reaching it has no device layout to lower.
     """
     seq_pad = align_up(seq)
     key = (b, seq, dtype, str(device))

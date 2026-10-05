@@ -902,13 +902,24 @@ def test_patched_encoder_forward_matches_stock(valid):
 
 def test_layers_stay_the_per_block_compile_unit():
     """`_compile_blocks` wraps each layer in place, which only bites if the patched
-    encoder still goes through `layer.__call__` instead of inlining the layer body."""
+    encoder still goes through `layer.__call__` instead of inlining the layer body.
+
+    The runner keeps every tower eager until a patch marks it, so discovery is asserted
+    on both sides of the mark: this is the whole of the Gemma-only scoping.
+    """
     from spyre_inference.multimodal import gemma4_vision
+    from spyre_inference.v1.worker.spyre_model_runner import _repeated_block_lists
 
     encoder = _encoder()
+    assert _repeated_block_lists(encoder) == []
+
     gemma4_vision.patch_vision_attention()
     gemma4_vision.patch_vision_encoder()
     _pad(encoder)
+    gemma4_vision.mark_blocks_compilable(
+        SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder))
+    )
+    assert _repeated_block_lists(encoder) == [encoder.layers]
 
     called: list[int] = []
     for i, layer in enumerate(encoder.layers):
@@ -959,6 +970,15 @@ def test_pad_vision_weights_pads_every_layer():
     for layer in encoder.layers:
         assert layer.self_attn.q_proj.linear.out_features == NUM_HEADS * PADDED_HEAD_DIM
         assert layer.mlp.gate_proj.linear.out_features == align_up(encoder.config.intermediate_size)
+
+
+def test_marking_is_a_no_op_without_a_vision_tower():
+    """A text-only gemma 4 run loads the decoder alone. Marking must not reach for an
+    encoder that is not there, and must not opt anything into per-block compile."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision.mark_blocks_compilable(SimpleNamespace())
+    gemma4_vision.mark_blocks_compilable(SimpleNamespace(vision_tower=SimpleNamespace()))
 
 
 def test_rope_swap_matmul_matches_the_slice_it_replaces():
