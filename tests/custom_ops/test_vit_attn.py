@@ -25,7 +25,7 @@ import einops
 import torch
 import torch.nn.functional as F
 
-from spyre_inference.custom_ops.vit_attn import _full_attend_mask, _padded_apply_sdpa, register
+from spyre_inference.custom_ops.vit_attn import _padded_apply_sdpa, register
 
 
 def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
@@ -68,17 +68,26 @@ class TestPaddedApplySdpaMatchesReference:
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-class TestFullAttendMaskCache:
-    def test_same_length_returns_the_same_object(self):
-        # padded_sdpa's own mask cache is keyed on this tensor's identity, so a
-        # stable object per length is what makes it actually hit across layers.
-        assert _full_attend_mask(50) is _full_attend_mask(50)
+class TestFullAttendMask:
+    def test_only_the_padded_keys_are_masked(self, monkeypatch):
+        """This path has no mask of its own, so the only keys to mask are the ones the
+        padding invents -- a `[1, 1, 1, seq_pad]` row, not an O(L²) host tensor."""
+        from spyre_inference.multimodal import utils
 
-    def test_different_lengths_return_different_objects(self):
-        assert _full_attend_mask(50) is not _full_attend_mask(64)
+        seen = []
+        stock = F.scaled_dot_product_attention
 
-    def test_attends_everywhere(self):
-        assert _full_attend_mask(17).all()
+        def spy(q, k, v, attn_mask=None, **kwargs):
+            seen.append(attn_mask)
+            return stock(q, k, v, attn_mask=attn_mask, **kwargs)
+
+        monkeypatch.setattr(utils.F, "scaled_dot_product_attention", spy)
+        _padded_apply_sdpa(*(torch.randn(1, 50, 2, 64) for _ in range(3)))
+
+        (mask,) = seen
+        assert mask.shape == (1, 1, 1, 64)
+        assert (mask[..., :50] == 0).all()
+        assert (mask[..., 50:] == torch.finfo(mask.dtype).min).all()
 
 
 class TestRegister:
