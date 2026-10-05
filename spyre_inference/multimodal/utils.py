@@ -106,6 +106,9 @@ def padded_sdpa(
     padded, or when the model carries its own scale.
 
     `mask=None` attends everywhere: only the padded keys are masked.
+
+    A `mask` already in `_padded_attn_mask`'s form is used as is, so a caller can pad it
+    outside a compiled block, where that function's attribute cache cannot live.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -130,8 +133,10 @@ def padded_sdpa(
 
     if mask is None:
         attn_mask = _key_pad_mask(b, seq, seq_pad, q.dtype, device)
-    else:
+    elif mask.shape != (b, 1, seq_pad, seq_pad) or mask.dtype != q.dtype or mask.device != device:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
+    else:
+        attn_mask = mask
     out = F.scaled_dot_product_attention(
         q,
         k,
