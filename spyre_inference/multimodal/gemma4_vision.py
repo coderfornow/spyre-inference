@@ -404,12 +404,7 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
 
 
 def patch_vision_attention() -> None:
-    """Replace `Gemma4VisionAttention.forward` with padded rope + `padded_sdpa`.
-
-    Patching the attention rather than inlining the whole layer leaves
-    `Gemma4VisionEncoderLayer.forward` stock, which is what lets the runner discover
-    the layer as a per-block compile unit.
-    """
+    """Replace `Gemma4VisionAttention.forward` with padded rope + `padded_sdpa`."""
     try:
         from transformers.models.gemma4 import modeling_gemma4
     except ImportError:
@@ -761,3 +756,17 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     pad_vision_weights(model)
     install_rope_swap(model)
     place_vision_tail_on_cpu(model)
+    mark_blocks_compilable(model)
+
+
+def mark_blocks_compilable(model: torch.nn.Module) -> None:
+    """Opt this tower's layers into the runner's per-block compile.
+
+    Marked on the instances and last, after the patches its layer body calls: a class
+    attribute would also mark a tower whose encoder patch had no-oped.
+    """
+    encoder = getattr(getattr(model, "vision_tower", None), "encoder", None)
+    if encoder is None:
+        return
+    for layer in encoder.layers:
+        layer._spyre_block_compilable = True

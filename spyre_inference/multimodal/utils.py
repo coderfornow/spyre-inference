@@ -47,7 +47,8 @@ def _padded_attn_mask(
     """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`.
 
     O(L²) and shared by every layer, so it is cached on the source mask: one upload
-    per image, released with its source.
+    per image, released with its source. A compiled block must call this outside its
+    layer loop -- a host tensor reaching it has no device layout to lower.
     """
     key = (b, seq, seq_pad, dtype, str(device))
     cached = getattr(mask, _MASK_ATTR, None)
