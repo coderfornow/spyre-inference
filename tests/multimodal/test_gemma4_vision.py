@@ -975,6 +975,48 @@ def test_marking_is_a_no_op_without_a_vision_tower():
     gemma4_vision.mark_blocks_compilable(SimpleNamespace(vision_tower=SimpleNamespace()))
 
 
+def _stub_tower(encoder_patched: bool, attn_patched: bool, rope_installed: bool):
+    """A tower whose encoder and attention claim the install state asked for."""
+
+    def _cls(patched: bool) -> type:
+        def forward(self):
+            raise AssertionError("not called")
+
+        forward._spyre_patched = patched
+        return type("Stub", (torch.nn.Module,), {"forward": forward})
+
+    layer = torch.nn.Module()
+    layer.self_attn = _cls(attn_patched)()
+    if rope_installed:
+        layer.self_attn.register_buffer("spyre_rope_swap", torch.eye(8), persistent=False)
+    encoder = _cls(encoder_patched)()
+    encoder.layers = torch.nn.ModuleList([layer])
+    return SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder))
+
+
+@pytest.mark.parametrize(
+    ("encoder_patched", "attn_patched", "rope_installed", "marked"),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_marking_follows_the_patches_it_depends_on(
+    encoder_patched, attn_patched, rope_installed, marked
+):
+    """An upstream rename makes a patch return early. Marking has to read that off the
+    patches: compiling a stock layer body would trace the host constants they hoist."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    model = _stub_tower(encoder_patched, attn_patched, rope_installed)
+    gemma4_vision.mark_blocks_compilable(model)
+
+    layers = model.vision_tower.encoder.layers
+    assert all(getattr(b, "_spyre_block_compilable", False) for b in layers) is marked
+
+
 def test_rope_swap_matmul_matches_the_slice_it_replaces():
     """`_apply_rope` rotates by a full-width matmul because the `cat`/slice form returns
     uncorrelated data on device and cannot be laid out at head_dim=64."""

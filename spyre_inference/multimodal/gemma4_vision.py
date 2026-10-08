@@ -762,11 +762,25 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
 def mark_blocks_compilable(model: torch.nn.Module) -> None:
     """Opt this tower's layers into the runner's per-block compile.
 
-    Marked on the instances and last, after the patches its layer body calls: a class
-    attribute would also mark a tower whose encoder patch had no-oped.
+    Marked on the instances, not the class, so a tower whose patches no-oped is not
+    opted in -- and read back off those patches rather than inferred from running last,
+    since an upstream rename makes any of them return early without saying so. All
+    three are load bearing: the encoder patch builds the mask ahead of the layer loop,
+    `install_rope_swap` puts the permutation the body reads on the module, and the
+    attention patch makes that body traceable. Unmarked, the tower stays eager.
     """
     encoder = getattr(getattr(model, "vision_tower", None), "encoder", None)
-    if encoder is None:
+    if encoder is None or len(encoder.layers) == 0:
+        return
+    attn = encoder.layers[0].self_attn
+    if not (
+        getattr(type(encoder).forward, "_spyre_patched", False)
+        and getattr(type(attn).forward, "_spyre_patched", False)
+        and hasattr(attn, _ROPE_SWAP_BUFFER)
+    ):
+        logger.warning_once(
+            "Spyre: Gemma 4 vision patches are not installed, so the tower stays eager."
+        )
         return
     for layer in encoder.layers:
         layer._spyre_block_compilable = True
