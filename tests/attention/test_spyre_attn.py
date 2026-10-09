@@ -357,9 +357,9 @@ def _run_spyre_attn_test(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)", marks=pytest.mark.attention_smoke),
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
-        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)", marks=pytest.mark.attention_smoke),
         pytest.param([(33, 96)], id="prefill(q=33,kv=96)"),
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
@@ -401,7 +401,9 @@ def test_spyre_attn_core(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param(
+            [(1, 256), (1, 512)], id="batch_decode(2seqs)", marks=pytest.mark.attention_smoke
+        ),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
         pytest.param([(1, 128), (1, 128)], id="batch_decode_shared_variant(2seqs)"),

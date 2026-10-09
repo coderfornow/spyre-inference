@@ -92,8 +92,9 @@ on:
             unit        — all spyre-native tests (per-op + attention +
                           distributed), excludes the heavy upstream-vLLM
                           suites
-            integration — fast per-op unit tests only, the smoke suite
-                          (1 config, single card)
+            integration — the smoke suite, a small attention subset, and
+                          the distributed shards (1- and 2-card jobs); the
+                          upstream-dependency dispatch's default
             regression  — every config (default)
             trunk       — push-to-main CI; same coverage as regression
           Same knob and vocabulary as the sibling repos (torch-spyre,
@@ -548,6 +549,17 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-encoder-attention
+          # Small decoder-attention subset carrying attention coverage into the integration
+          # tier, which the full test-attention-shard-* suite above is excluded from. Hence
+          # integration-only: regression/trunk/unit already run the full shards.
+          - cfg: Spyre attention smoke
+            test_types: integration
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-smoke
           # Distributed (TP=2) suite, sharded across parallel 2-card jobs. Each
           # case spawns a TP=2 subprocess pair, so the model-run cases dominate;
           # the plugin's weighted partition balances by recorded runtime.
@@ -1182,7 +1194,8 @@ jobs:
           echo "benchmarks done"
 
       # A dispatch by SHA names no branch; claim the dispatch ref only when it contains the
-      # commit, rather than recording the SHA as a branch.
+      # commit, rather than recording the SHA as a branch. curl, not `gh`: the runner image has no
+      # gh, and a silent failure here recorded every dispatched run with an empty branch.
       - name: Resolve the tested commit and branch
         id: tested
         if: ${{ !cancelled() && github.event_name != 'pull_request' }}
@@ -1195,7 +1208,10 @@ jobs:
           SHA="$(git rev-parse HEAD)"
           BRANCH="${REF_IN:-${REF_NAME}}"
           if [[ "${BRANCH}" =~ ^[0-9a-f]{7,40}$ ]]; then
-            STATUS="$(gh api "repos/${REPO}/compare/${REF_NAME}...${SHA}" --jq .status 2>/dev/null || true)"
+            STATUS="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${GITHUB_API_URL}/repos/${REPO}/compare/${REF_NAME}...${SHA}?per_page=1" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])' 2>/dev/null)" \
+              || echo "::warning::could not compare ${REF_NAME}...${SHA}; recording no branch"
             case "${STATUS}" in
               identical|behind) BRANCH="${REF_NAME}" ;;
               *) BRANCH="" ;;

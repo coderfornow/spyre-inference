@@ -364,6 +364,8 @@ jobs:
           repository: ${{ github.repository }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          # Tags the artifact <repo>@<sha12> (push to main) or <repo>#<pr>[@<sha12>] (PR).
+          ci-event: ${{ env.TRIGGERING_EVENT }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
           platform: x86_64
           component: spyre-inference
