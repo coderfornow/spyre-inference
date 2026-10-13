@@ -30,6 +30,27 @@ def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
 
 
+def rope_perm_matrix(kind: str, head_dim: int) -> torch.Tensor:
+    """Constant fp16 `[head_dim, head_dim]` permutation `M` on CPU so `x @ M` is a rope shuffle.
+
+    Rotating by a full-width matmul avoids slicing the head into `d/2`-wide halves:
+    at head_dim=64 that half is 32, which torch-spyre cannot lay out ("Unexpected
+    stick expression ... Mod(var, 32)"). kind="pair" swaps each `(2k, 2k+1)` pair.
+    """
+    if kind != "pair":
+        raise ValueError(f"unknown rope permutation kind {kind!r}")
+    m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
+    even = torch.arange(0, head_dim, 2)
+    m[even, even + 1] = 1.0
+    m[even + 1, even] = 1.0
+    return m
+
+
+def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
+    """`x*cos + (x @ m)*sin` — the rope rotation as a stick-aligned matmul."""
+    return x * cos + torch.matmul(x, m) * sin
+
+
 # Attribute under which a source mask caches its padded counterpart `(key, padded)`.
 _MASK_ATTR = "_spyre_padded_mask"
 
@@ -146,6 +167,10 @@ def padded_sdpa(
             if seq == seq_pad
             else _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, q.dtype, device)]
         )
+    elif not padded and mask.device == device and mask.is_floating_point():
+        # Already additive, aligned and on the card, e.g. built inside a compiled graph,
+        # where the host round trip below cannot run.
+        attn_mask = mask
     else:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(

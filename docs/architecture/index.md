@@ -223,7 +223,8 @@ Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entr
 (`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
 hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
-(`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager. Models whose
+(`vision_encoder`, `vision_tower`, `vision_model`, `visual`): it stays eager unless the model
+compiles it per encoder budget (see [Vision encoders](#vision-encoders)). Models whose
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
 
@@ -254,6 +255,55 @@ on the wrapper — so its projection compiles its own graph, over row widths war
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.
+
+## Vision encoders
+
+A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
+class with `SpyreVisionEncoderMixin` (`models/vision/base.py`) ahead of it. The mixin implements
+upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
+`EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
+pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
+(`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
+compiles the encoder at that static shape during warmup, and replay uploads the padded
+inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
+kernels, so the compile guard covers the vision graphs. Upstream's
+`GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
+the embedding merge, encoder cache and decoder are unchanged.
+
+The encoder is three graphs per budget, so all `n` blocks share one artifact:
+
+| Graph | Mixin hook | Native Pixtral (`models/pixtral.py`) |
+|---|---|---|
+| pre | `vision_pre(values)` | patch linear (the conv weight flattened), `ln_pre`, the image mask |
+| blocks | `vision_blocks()` | upstream `TransformerBlock`s with `SpyrePixtralAttention` |
+| post | `vision_post(x)` | `pre_mm_projector_norm`, patch merge, `VisionLanguageAdapter` |
+
+A model also implements upstream's host-side methods `get_encoder_cudagraph_item_specs`,
+`select_encoder_cudagraph_items` and `prepare_encoder_cudagraph_replay_buffers`, and sets
+`vision_buffers`, `rows_per_token` (`M²` for an `M×M` merge), `max_tokens_per_item` and
+`out_hidden_size`. Everything else in the protocol, the eager (`enforce_eager`) path and the
+per-image output split come from the mixin. Upstream's processor, weight mapper, placeholders
+and `embed_input_ids` are inherited unchanged.
+
+Constraints the layout follows:
+
+- Each budget's rows are rounded up to a whole number of 64-wide sticks, and the largest
+  budget must hold the largest image (`max_tokens_per_item`) or startup fails. There is no
+  eager fallback mid-request.
+- Rows are **offset-major**: one block per offset inside a merge group, each padded at
+  its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
+  and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
+  reshape feeding a matmul cannot be laid out.
+- The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
+  column reserved for padding rows), not a column-minus-row broadcast, which torch-spyre
+  cannot lay out.
+- RoPE cos/sin are gathered by position on the host and enter as graph inputs; the rotation is
+  a matmul against a constant pair-swap matrix, since a 64-wide head's 32-wide halves cannot
+  be sliced.
+- The encoder output comes back to the host in one copy and is sliced there: device views
+  at row offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
+  runs on the host anyway.
+- Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
 
 ## Attention Backend
 

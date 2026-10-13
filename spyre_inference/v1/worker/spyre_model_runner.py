@@ -85,6 +85,7 @@ from spyre_inference.custom_ops.mlp_pad import (
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
+from spyre_inference.models.vision.base import SpyreVisionEncoderMixin
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -116,6 +117,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
@@ -306,8 +308,8 @@ def _is_decoder_attention_like(module: nn.Module) -> bool:
     # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
     # vLLM's KV-cache attention implementation. Transformers may prefix the
     # implementation with ``paged|`` when it enables its paged-cache wrapper.
-    # TODO: Drop the decoder-only restriction when
-    # test_spyre_compiled_pixtral_vision_attention_coarse_tile XPASSes.
+    # Vision towers compile through ``SpyreVisionEncoderMixin`` instead, per encoder
+    # budget, not through ``_compile_blocks``.
     implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
     return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
         "|"
@@ -462,7 +464,9 @@ class _SpyreModelWrapper:
                 return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
-        kwargs = tree_map(_to_spyre_float, kwargs)
+        # These prepare their inputs on the host and upload once themselves.
+        if not isinstance(self._model, SpyreVisionEncoderMixin):
+            kwargs = tree_map(_to_spyre_float, kwargs)
         # Vision towers run eager, so each Spyre op with a decomposition reaches it
         # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
         # without fullgraph. Decompositions built on for_each_tile (SDPA since
@@ -520,7 +524,10 @@ class _SpyreModelWrapper:
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
         is_multimodal = self._to_spyre(is_multimodal)
-        multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
+        # Their encoder output is already on the host, where the merge scatters it;
+        # uploading first would compile a device concat per distinct row count.
+        if not isinstance(self._model, SpyreVisionEncoderMixin):
+            multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
 
         result = self._model.embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
@@ -984,6 +991,44 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+        self._record_vision_graphs()
+
+    @torch.inference_mode()
+    def _record_vision_graphs(self) -> None:
+        """Compile the vision encoder at every encoder budget, before serving.
+
+        Upstream's ``_execute_mm_encoder`` already routes through
+        ``encoder_cudagraph_manager``; creating it here is what makes serving use it.
+        """
+        model = self._compiled_vision_model()
+        if model is None:
+            return
+        with _set_spyre_compilation_settings(self.vllm_config):
+            model.compile_vision_graphs()
+            self._maybe_init_encoder_cudagraph_manager()
+            assert self.encoder_cudagraph_manager is not None
+            self.encoder_cudagraph_manager.capture(graph_pool=None)
+
+    def _compiled_vision_model(self) -> SpyreVisionEncoderMixin | None:
+        model = getattr(self.model, "_model", self.model)
+        if (
+            not self.supports_mm_inputs
+            or not isinstance(model, SpyreVisionEncoderMixin)
+            or self.model_config.enforce_eager
+            or self.compilation_config.mode is CompilationMode.NONE
+        ):
+            return None
+        return model
+
+    def _create_encoder_cudagraph_manager(self) -> SpyreEncoderGraphManager | None:
+        """Upstream's factory, keyed on compiled mode instead of ``cudagraph_mm_encoder``,
+        which means CUDA graphs and also gates GPU-only memory profiling."""
+        model = self._compiled_vision_model()
+        if model is None:
+            return None
+        return SpyreEncoderGraphManager(
+            self.vllm_config, self._spyre_device, self._model_dtype(), model
+        )
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:
@@ -1003,8 +1048,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
         model = cast(_SpyreModelWrapper, self.model)
         # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
-        model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
+        input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+        model.embed_input_ids(input_ids)
         logger.info_once("Warming the input embedding through embed_input_ids.")
+        vision = model._model
+        if isinstance(vision, SpyreVisionEncoderMixin):
+            # The image merge's device select compiles per token bucket, and only a
+            # step that schedules image placeholders reaches it.
+            is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
+            is_multimodal[0] = True
+            image_rows = [torch.zeros(1, vision.out_hidden_size, dtype=self._model_dtype())]
+            model.embed_input_ids(input_ids, image_rows, is_multimodal=is_multimodal)
 
     @torch.inference_mode()
     def _warmup_multimodal_encoder(self) -> None:
