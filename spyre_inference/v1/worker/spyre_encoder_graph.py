@@ -17,7 +17,6 @@ capturing a CUDA graph. Budgets, packing, padding and the per-item split are ups
 
 from __future__ import annotations
 
-import math
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -26,7 +25,6 @@ from vllm.logger import init_logger
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -51,8 +49,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
-        # Every L must be whole sticks of rows.
-        step = math.lcm(STICK, model.rows_per_token) // model.rows_per_token
+        # Every L must be a whole number of the model's row quantum.
+        step = model.vision_row_quantum // model.rows_per_token
 
         def aligned(budgets: list[int]) -> list[int]:
             return sorted({-(-b // step) * step if b > 0 else b for b in budgets})
@@ -65,6 +63,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 f"image ({model.max_tokens_per_item} tokens), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
+        if model.vision_max_items_per_call is not None:
+            self.max_batch_size = min(self.max_batch_size, model.vision_max_items_per_call)
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
     def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
@@ -97,9 +97,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path
         )
         for key, buf in staging.items():
-            src = replay.values.get(key)
-            if src is not None:
-                self.config.padding_logics.get(key, self._copy_padded_buffer)(buf, src)
+            # The mixin's replay buffers are validated: every key present, none None.
+            self.config.padding_logics[key](buf, cast(torch.Tensor, replay.values[key]))
         with torch.inference_mode():
             output = self.model.encoder_cudagraph_forward(self._upload(staging), path=path)
         self.graph_hits += num_items

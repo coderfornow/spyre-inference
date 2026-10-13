@@ -28,10 +28,6 @@ import torch.nn.functional as F
 from vllm.model_executor.models import pixtral
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-from vllm.v1.worker.encoder_cudagraph_defs import (
-    EncoderCudaGraphReplayBuffers,
-    EncoderItemSpec,
-)
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
@@ -128,6 +124,9 @@ def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
 class SpyrePixtralForConditionalGeneration(
     SpyreVisionEncoderMixin, pixtral.PixtralForConditionalGeneration
 ):
+    # One-hot segments: the last column is the padding rows' own image.
+    vision_max_items_per_call = STICK - 1
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_spyre_vision(prefix)
@@ -142,7 +141,6 @@ class SpyrePixtralForConditionalGeneration(
         self._row_width = align_up(args.num_channels * args.patch_size**2)
         self.vision_buffers = {
             "rows": VisionBuffer(self._row_width),
-            # One-hot image of each row; padding rows take the last column, their own image.
             "segments": VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half()),
             "cos": VisionBuffer(head_dim),
             "sin": VisionBuffer(head_dim),
@@ -183,10 +181,12 @@ class SpyrePixtralForConditionalGeneration(
     def get_max_frames_per_video(self) -> int:
         return 1
 
-    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
+    def vision_item_rows(self, mm_kwargs: dict[str, Any]) -> list[int]:
         p = self.vision_args.patch_size
-        rows = [(img.shape[-2] // p) * (img.shape[-1] // p) for img in _images(mm_kwargs)]
-        return [EncoderItemSpec(input_size=n, output_tokens=n // self.rows_per_token) for n in rows]
+        return [
+            (img.shape[-2] // p) * (img.shape[-1] // p) // self.rows_per_token
+            for img in _images(mm_kwargs)
+        ]
 
     def select_encoder_cudagraph_items(
         self, mm_kwargs: dict[str, Any], indices: list[int]
@@ -194,17 +194,10 @@ class SpyrePixtralForConditionalGeneration(
         images = _images(mm_kwargs)
         return {**mm_kwargs, "images": [images[i] for i in indices]}
 
-    def prepare_encoder_cudagraph_replay_buffers(
-        self,
-        mm_kwargs: dict[str, Any],
-        max_batch_size: int,
-        max_frames_per_batch: int,
-        path: str = "default",
-    ) -> EncoderCudaGraphReplayBuffers:
+    def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Offset-major patch rows of every image, flattened as ``(c, py, px)`` like the conv
         weight, with each row's one-hot image and its gathered RoPE."""
         images = _images(mm_kwargs)
-        assert len(images) < STICK, f"{len(images)} images in one call; at most {STICK - 1} fit"
         p, m = self.vision_args.patch_size, self._merge
         rows, seg, pos = [], [], []
         for i, img in enumerate(images):
@@ -218,13 +211,12 @@ class SpyrePixtralForConditionalGeneration(
             seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
         flat = torch.cat(rows, dim=1).flatten(0, 1).to(torch.float16)
         positions = torch.cat(pos, dim=1).flatten()
-        values = {
+        return {
             "rows": F.pad(flat, (0, self._row_width - flat.shape[1])),
             "segments": F.one_hot(torch.cat(seg, dim=1).flatten(), STICK).to(torch.float16),
             "cos": self._rope_cos[positions].to(torch.float16),
             "sin": self._rope_sin[positions].to(torch.float16),
         }
-        return EncoderCudaGraphReplayBuffers(values=dict(values))
 
     def vision_pre(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_encoder
@@ -238,7 +230,7 @@ class SpyrePixtralForConditionalGeneration(
     def vision_blocks(self) -> nn.ModuleList:
         return self.vision_encoder.transformer.layers
 
-    def vision_post(self, x: torch.Tensor) -> torch.Tensor:
+    def vision_post(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
         x = x.squeeze(0)
         if self.pre_mm_projector_norm is not None:
             x = self.pre_mm_projector_norm(x)

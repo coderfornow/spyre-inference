@@ -270,29 +270,41 @@ kernels, so the compile guard covers the vision graphs. Upstream's
 `GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
 the embedding merge, encoder cache and decoder are unchanged.
 
-The encoder is three graphs per budget, so all `n` blocks share one artifact:
+Adding a model means one file in `models/` (plus its `_ADAPTED_ARCHS` entry): the subclass
+implements the hooks below and nothing in the runner or manager changes. An encoder *row* is
+one row of `vision_post`'s output; upstream's token budgets and `EncoderItemSpec.output_tokens`
+count these rows, and host inputs have `rows_per_token` rows per output row.
 
-| Graph | Mixin hook | Native Pixtral (`models/pixtral.py`) |
-|---|---|---|
-| pre | `vision_pre(values)` | patch linear (the conv weight flattened), `ln_pre`, the image mask |
-| blocks | `vision_blocks()` | upstream `TransformerBlock`s with `SpyrePixtralAttention` |
-| post | `vision_post(x)` | `pre_mm_projector_norm`, patch merge, `VisionLanguageAdapter` |
+| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) |
+|---|---|---|---|
+| `vision_buffers`, `rows_per_token`, `out_hidden_size` | yes | fp16 host inputs and their padding rows; input rows per output row; output width | patch rows, one-hot segments, cos, sin; `M²`; text hidden size |
+| `vision_item_rows(mm_kwargs)` | yes | encoder rows per item, for packing into budgets | patches / `M²` per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major rows, segments, gathered RoPE |
+| `vision_pre(values)` | yes | graph 1: `-> (x, block_kwargs)` | patch linear, `ln_pre`, image mask |
+| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
+| `vision_post(x, taps)` | yes | graph 3: `-> [rows, out_hidden_size]` | projector norm, patch merge, adapter |
+| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
+| `vision_taps` | no | intermediate hidden states passed to `vision_post` | none |
+| `vision_finalize` | no | host step from encoder rows to placeholder embeddings (unpad, newline rows) | default split |
+| `vision_row_blocks`, `vision_row_quantum` | no | padding layout and alignment (default: offset blocks, 64-row sticks) | default |
+| `vision_max_tokens_per_item(mm_budget)` | no | largest item in encoder rows (default: the processor's count) | default |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
 
-A model also provides upstream's host-side `prepare_encoder_cudagraph_replay_buffers` and sets
-`vision_buffers`, `rows_per_token` (`M²` for an `M×M` merge) and `out_hidden_size`. Item specs,
-item selection and the modality come from the upstream class when it implements the protocol
-(Gemma 3/4, Qwen-VL); the mixin deliberately leaves them alone so it never shadows those.
-Upstream Pixtral does not implement it, so `SpyrePixtralForConditionalGeneration` writes its
-own. The rest of the protocol, the eager (`enforce_eager`) path and the per-image output split
-come from the mixin. Upstream's processor, weight mapper, placeholders and `embed_input_ids` are
-inherited unchanged.
+The mixin owns the protocol methods tied to this layout (`prepare_encoder_cudagraph_replay_buffers`,
+item specs, capture inputs, forward, postprocess), so an upstream class's own versions of those
+are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
+upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
+upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. The eager
+(`enforce_eager`) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
+placeholders and `embed_input_ids` are inherited unchanged.
 
 Constraints the layout follows:
 
-- The largest budget is the largest image the model's upstream processor can produce
+- The largest budget is the largest item the model's upstream processor can produce
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
-  uses), so no image needs a shape warmup skipped. Each budget's rows are rounded up to a
-  whole number of 64-wide sticks.
+  uses, converted to encoder rows by `vision_max_tokens_per_item`), so no item needs a shape
+  warmup skipped. Each budget is a whole number of `vision_row_quantum` rows.
 - Rows are **offset-major**: one block per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`

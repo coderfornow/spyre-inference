@@ -1020,10 +1020,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model = self._compiled_vision_model()
         if model is None:
             return None
-        # The largest warmup shape is the processor's largest image, as upstream computes
-        # it for the scheduler's encoder budget.
+        # The largest warmup shape is the processor's largest item, as upstream computes it
+        # for the scheduler's encoder budget, in the model's encoder rows.
         assert self.mm_budget is not None
-        model.max_tokens_per_item = self.mm_budget.mm_max_toks_per_item["image"]
+        model.max_tokens_per_item = model.vision_max_tokens_per_item(self.mm_budget)
         return SpyreEncoderGraphManager(
             self.vllm_config, self._spyre_device, self._model_dtype(), model
         )

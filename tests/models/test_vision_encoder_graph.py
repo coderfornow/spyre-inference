@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``SpyreEncoderGraphManager`` on upstream's budget logic, with a fake model on CPU.
-
-Upstream's packing and padding run unchanged; these pin the Spyre parts: stick-aligned
-budgets, the startup coverage check, per-block padding and the compiled-graph replay.
-"""
+"""The ``SpyreVisionEncoderMixin`` contract and ``SpyreEncoderGraphManager``, on CPU with a
+fake model: what a model author can rely on without touching any other file."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -24,7 +21,6 @@ from typing import Any
 import pytest
 import torch
 import torch.nn as nn
-from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers, EncoderItemSpec
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
@@ -32,46 +28,59 @@ from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManag
 MERGE_ROWS = 4  # 2x2 merge
 
 
-class _FakeVisionModel(SpyreVisionEncoderMixin, nn.Module):
-    """Each item is ``tokens`` merged tokens whose rows hold the item's index + 1."""
+class _Upstream(nn.Module):
+    """Stands in for the upstream model class the mixin sits ahead of."""
 
-    def __init__(self, max_tokens: int = 300) -> None:
-        nn.Module.__init__(self)
+    def get_input_modality(self, mm_kwargs):
+        return mm_kwargs.get("modality", "image")
+
+    def embed_multimodal(self, **kwargs):
+        return ("upstream",)
+
+
+class _Block(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.unused = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def forward(self, x, offset):
+        return x + offset
+
+
+class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
+    """Item ``i`` is ``tokens[i]`` rows per offset block, all holding ``i + 1``."""
+
+    def __init__(self, max_tokens: int = 300, num_blocks: int = 1) -> None:
+        super().__init__()
         self.rows_per_token = MERGE_ROWS
         self.max_tokens_per_item = max_tokens
         self.out_hidden_size = 8
         self.vision_buffers = {"rows": VisionBuffer(8), "segments": VisionBuffer(None, pad=-1.0)}
-        self.blocks = nn.ModuleList([nn.Identity()])
+        self.blocks = nn.ModuleList([_Block() for _ in range(num_blocks)])
         self.forward_rows: list[int] = []
+        self.seen_taps: list[list[torch.Tensor]] = []
 
-    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
-        return [
-            EncoderItemSpec(input_size=t * MERGE_ROWS, output_tokens=t) for t in mm_kwargs["tokens"]
-        ]
+    def vision_item_rows(self, mm_kwargs: dict[str, Any]) -> list[int]:
+        return list(mm_kwargs["tokens"])
 
     def select_encoder_cudagraph_items(self, mm_kwargs, indices):
         return {"tokens": [mm_kwargs["tokens"][i] for i in indices], "ids": indices}
 
-    def prepare_encoder_cudagraph_replay_buffers(
-        self, mm_kwargs, max_batch_size, max_frames, path="default"
-    ):
+    def vision_inputs(self, mm_kwargs):
         ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
-        # Offset-major: per offset block, every item's tokens in order.
         seg = torch.cat([torch.full((t,), float(i + 1)) for i, t in zip(ids, mm_kwargs["tokens"])])
-        seg = seg.repeat(MERGE_ROWS)
-        rows = seg[:, None].expand(-1, 8).to(torch.float16)
-        return EncoderCudaGraphReplayBuffers(
-            values={"rows": rows, "segments": seg.to(torch.float16)}
-        )
+        seg = seg.repeat(MERGE_ROWS).to(torch.float16)
+        return {"rows": seg[:, None].expand(-1, 8).contiguous(), "segments": seg}
 
     def vision_pre(self, values):
-        return values["rows"], {}
+        return values["rows"], {"offset": 0.0}
 
     def vision_blocks(self):
         return self.blocks
 
-    def vision_post(self, x):
+    def vision_post(self, x, taps):
         self.forward_rows.append(x.shape[0])
+        self.seen_taps.append(taps)
         return x.reshape(MERGE_ROWS, -1, x.shape[-1]).mean(dim=0)
 
 
@@ -98,13 +107,13 @@ def _manager(model, **kwargs) -> SpyreEncoderGraphManager:
     )
 
 
-def test_budgets_are_stick_aligned_and_cover_the_largest_image():
+def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     manager = _manager(_FakeVisionModel(max_tokens=300))
     assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
     assert all(b * MERGE_ROWS % 64 == 0 for b in manager.token_budgets)
 
 
-def test_user_budgets_below_the_largest_image_fail_at_startup():
+def test_user_budgets_below_the_largest_item_fail_at_startup():
     with pytest.raises(ValueError, match="largest encoder budget"):
         _manager(_FakeVisionModel(max_tokens=300), budgets=[16, 64])
 
@@ -117,22 +126,83 @@ def test_encoder_data_parallel_is_rejected():
 def test_execute_packs_pads_per_block_and_splits_per_item():
     model = _FakeVisionModel(max_tokens=300)
     manager = _manager(model)
-    manager.capture()
+    manager.capture(graph_pool=None)
     assert sorted(model.forward_rows) == sorted(b * MERGE_ROWS for b in manager.token_budgets)
 
     model.forward_rows.clear()
     outputs = manager.execute({"tokens": [10, 30]})
 
-    # 40 tokens pack into the 64-token budget: one compiled call at 256 rows.
+    # 40 rows pack into the 64-row budget: one compiled call at 256 input rows.
     assert model.forward_rows == [64 * MERGE_ROWS]
     assert [o.shape[0] for o in outputs] == [10, 30]
-    # Per-block padding keeps each item's rows on its own tokens in every block.
     for i, out in enumerate(outputs):
         assert out.device.type == "cpu"
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
 
 
 def test_unrecorded_budget_is_a_miss():
-    model = _FakeVisionModel()
-    manager = _manager(model)
+    manager = _manager(_FakeVisionModel())
     assert manager._run_budget_graph({"tokens": [10]}, 16) is None
+
+
+def test_inputs_must_match_the_declared_buffers():
+    """An upstream ``prepare_encoder_cudagraph_replay_buffers`` with other keys would
+    otherwise replay stale padding rows silently."""
+    model = _FakeVisionModel()
+    model.vision_inputs = lambda mm_kwargs: {"rows": torch.zeros(4, 8, dtype=torch.float16)}
+    with pytest.raises(ValueError, match="vision_buffers declares"):
+        model.prepare_encoder_cudagraph_replay_buffers({"tokens": [1]}, 0, 0)
+
+
+def test_inputs_must_be_fp16_with_one_row_count():
+    model = _FakeVisionModel()
+    model.vision_inputs = lambda mm_kwargs: {
+        "rows": torch.zeros(4, 8),
+        "segments": torch.zeros(4, dtype=torch.float16),
+    }
+    with pytest.raises(ValueError, match="fp16"):
+        model.prepare_encoder_cudagraph_replay_buffers({"tokens": [1]}, 0, 0)
+
+
+def test_items_per_call_cap_splits_the_batch():
+    model = _FakeVisionModel()
+    type(model).vision_max_items_per_call = 1
+    try:
+        manager = _manager(model)
+        manager.capture(graph_pool=None)
+        model.forward_rows.clear()
+        outputs = manager.execute({"tokens": [10, 30]})
+    finally:
+        del type(model).vision_max_items_per_call
+    assert manager.max_batch_size == 1
+    assert len(model.forward_rows) == 2
+    assert [o.shape[0] for o in outputs] == [10, 30]
+
+
+def test_taps_reach_vision_post_in_declared_order():
+    model = _FakeVisionModel(num_blocks=3)
+    type(model).vision_taps = (-1, 0, 2)
+    try:
+        bufs = model._vision_empty(64)
+        bufs["rows"][:] = 1.0
+        model.blocks[0].forward = lambda x, offset: x + 1
+        model.blocks[1].forward = lambda x, offset: x + 10
+        model.blocks[2].forward = lambda x, offset: x + 100
+        model.encoder_cudagraph_forward(bufs)
+    finally:
+        del type(model).vision_taps
+    (taps,) = model.seen_taps
+    assert [float(t[0, 0]) for t in taps] == [112.0, 1.0, 12.0]
+
+
+def test_finalize_hook_shapes_each_item():
+    model = _FakeVisionModel()
+    model.vision_finalize = lambda out, rows, mm_kwargs: [
+        t[1:] for t in torch.split(out[: sum(rows)], rows)
+    ]
+    embeds = model.embed_multimodal(tokens=[10, 30])
+    assert [e.shape[0] for e in embeds] == [9, 29]
+
+
+def test_other_modalities_go_to_upstream():
+    assert _FakeVisionModel().embed_multimodal(modality="audio") == ("upstream",)
