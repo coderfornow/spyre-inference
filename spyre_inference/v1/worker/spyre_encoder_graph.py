@@ -12,13 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Upstream's encoder budget manager with compile-at-boot in place of CUDA graphs.
-
-Budget choice, user overrides, greedy packing of images into budgets, replay padding
-and per-image output splitting are all inherited. Only capture and replay change: a
-captured budget is a set of compiled graphs traced at that static shape, and replay
-copies the inputs into host staging buffers, uploads them and runs those graphs.
-"""
+"""Upstream's encoder budget manager, compiling each budget at warmup instead of
+capturing a CUDA graph. Budgets, packing, padding and the per-item split are upstream's."""
 
 from __future__ import annotations
 
@@ -37,7 +32,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
 
-    from spyre_inference.models.vision.base import SpyreVisionEncoderMixin
+    from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 
 logger = init_logger(__name__)
 
@@ -50,15 +45,13 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         dtype: torch.dtype,
         model: SpyreVisionEncoderMixin,
     ) -> None:
-        # The mixin plus the model's own host methods make up the protocol.
         super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
-        self.model: SpyreVisionEncoderMixin = model
         if self.use_dp:
             raise NotImplementedError(
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
-        # Every L must be whole sticks of rows: round each budget up and dedupe.
+        # Every L must be whole sticks of rows.
         step = math.lcm(STICK, model.rows_per_token) // model.rows_per_token
 
         def aligned(budgets: list[int]) -> list[int]:
@@ -73,20 +66,6 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
-
-    def capture(self, graph_pool: Any = None) -> None:
-        """Compile every budget, largest first, so Inductor caches serve the smaller ones."""
-        t0 = time.time()
-        for path, budgets in self.path_token_budgets.items():
-            for token_budget in sorted(budgets, reverse=True):
-                if token_budget > 0:
-                    self._capture_budget_graph(token_budget, path=path)
-        logger.info(
-            "Vision encoder compiled for %d budgets %s in %.1fs.",
-            self.get_num_graphs_to_capture(),
-            self.token_budgets,
-            time.time() - t0,
-        )
 
     def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
         values = self.model.prepare_encoder_cudagraph_capture_inputs(

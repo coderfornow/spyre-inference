@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers, EncoderItemSpec
 
-from spyre_inference.models.vision.base import SpyreVisionEncoderMixin, VisionBuffer
+from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
 MERGE_ROWS = 4  # 2x2 merge

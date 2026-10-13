@@ -83,9 +83,9 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
+from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
-from spyre_inference.models.vision.base import SpyreVisionEncoderMixin
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -995,11 +995,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:
-        """Compile the vision encoder at every encoder budget, before serving.
-
-        Upstream's ``_execute_mm_encoder`` already routes through
-        ``encoder_cudagraph_manager``; creating it here is what makes serving use it.
-        """
+        """Compile the vision encoder at every budget; serving then runs through the manager."""
         model = self._compiled_vision_model()
         if model is None:
             return
@@ -1014,18 +1010,20 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if (
             not self.supports_mm_inputs
             or not isinstance(model, SpyreVisionEncoderMixin)
-            or self.model_config.enforce_eager
             or self.compilation_config.mode is CompilationMode.NONE
         ):
             return None
         return model
 
     def _create_encoder_cudagraph_manager(self) -> SpyreEncoderGraphManager | None:
-        """Upstream's factory, keyed on compiled mode instead of ``cudagraph_mm_encoder``,
-        which means CUDA graphs and also gates GPU-only memory profiling."""
+        # Not keyed on `cudagraph_mm_encoder`, which also gates GPU-only memory profiling.
         model = self._compiled_vision_model()
         if model is None:
             return None
+        # The largest warmup shape is the processor's largest image, as upstream computes
+        # it for the scheduler's encoder budget.
+        assert self.mm_budget is not None
+        model.max_tokens_per_item = self.mm_budget.mm_max_toks_per_item["image"]
         return SpyreEncoderGraphManager(
             self.vllm_config, self._spyre_device, self._model_dtype(), model
         )

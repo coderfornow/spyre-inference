@@ -17,7 +17,7 @@
 One module per architecture, each exposing `apply(model, device)`. These monkeypatch
 upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
 implementations by layer class. Architectures migrated to a registered subclass on
-`models.vision.base.SpyreVisionEncoderMixin` (native Pixtral) are not patched here.
+`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral) are not patched here.
 """
 
 import torch
@@ -37,7 +37,7 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     A no-op for text-only models. Call after weights are on the device but before
     compile, which wraps modules in `OptimizedModule` and breaks traversal.
     """
-    from spyre_inference.models.vision.base import SpyreVisionEncoderMixin
+    from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 
     # Adapted by their registered architecture subclass, not by patches.
     if isinstance(model, SpyreVisionEncoderMixin):

@@ -30,15 +30,9 @@ def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
 
 
-def rope_perm_matrix(kind: str, head_dim: int) -> torch.Tensor:
-    """Constant fp16 `[head_dim, head_dim]` permutation `M` on CPU so `x @ M` is a rope shuffle.
-
-    Rotating by a full-width matmul avoids slicing the head into `d/2`-wide halves:
-    at head_dim=64 that half is 32, which torch-spyre cannot lay out ("Unexpected
-    stick expression ... Mod(var, 32)"). kind="pair" swaps each `(2k, 2k+1)` pair.
-    """
-    if kind != "pair":
-        raise ValueError(f"unknown rope permutation kind {kind!r}")
+def pair_swap_matrix(head_dim: int) -> torch.Tensor:
+    """fp16 `M` with `x @ M` swapping each `(2k, 2k+1)` pair: a RoPE rotation by matmul,
+    since torch-spyre cannot slice a 64-wide head into 32-wide halves."""
     m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
     even = torch.arange(0, head_dim, 2)
     m[even, even + 1] = 1.0

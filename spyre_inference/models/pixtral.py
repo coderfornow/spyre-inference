@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native Mistral-format Pixtral (e.g. Ministral-3) with a bucketed, compiled vision tower."""
+"""Native Mistral-format Pixtral (e.g. Ministral-3) with a compiled, bucketed vision tower.
+
+Patch rows are laid out offset-major (see ``offset_major``). The tower is
+permutation-equivariant while RoPE positions and the image mask follow the rows, so the
+reorder only changes how the patch merge lowers.
+"""
 
 from __future__ import annotations
 
@@ -20,10 +25,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
-from vllm.model_executor.models.pixtral import (
-    PixtralForConditionalGeneration,
-    VisionTransformer,
-)
+from vllm.model_executor.models import pixtral
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -31,15 +33,19 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderItemSpec,
 )
 
-from spyre_inference.models.vision.base import SpyreVisionEncoderMixin, VisionBuffer
-from spyre_inference.models.vision.pixtral import (
-    SpyrePixtralAttention,
-    offset_major_merge_weight,
-    pixtral_patch_rows,
-    pixtral_rope_tables,
-    segment_pad_row,
+from spyre_inference.custom_ops.utils import convert
+from spyre_inference.models._vision_encoder import (
+    SpyreVisionEncoderMixin,
+    VisionBuffer,
+    offset_major,
 )
-from spyre_inference.multimodal.utils import STICK, align_up
+from spyre_inference.multimodal.utils import (
+    STICK,
+    align_up,
+    padded_sdpa,
+    pair_swap_matrix,
+    rope_rotate_matmul,
+)
 
 if TYPE_CHECKING:
     from torch import nn
@@ -47,6 +53,59 @@ if TYPE_CHECKING:
 
 # Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
 _MASK_MIN = torch.finfo(torch.float16).min / 2
+
+
+class SpyrePixtralAttention(pixtral.Attention):
+    """Upstream's attention with a matmul RoPE and the stick-aligned SDPA.
+
+    ``freqs_cis`` is a ``(cos, sin)`` pair gathered on the host: Spyre has no complex dtype.
+    """
+
+    rope_perm: torch.Tensor
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.register_buffer("rope_perm", pair_swap_matrix(self.head_dim), persistent=False)
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        cos, sin = freqs_cis
+        batch, patches, _ = x.shape
+        qkv, _ = self.qkv_proj(x)
+        q, k, v = (
+            t.reshape(batch, patches, self.n_heads, self.head_dim).transpose(1, 2)
+            for t in qkv.chunk(3, dim=-1)
+        )
+        q = rope_rotate_matmul(q, cos, sin, self.rope_perm)
+        k = rope_rotate_matmul(k, cos, sin, self.rope_perm)
+        out = padded_sdpa(q, k, v, mask)
+        out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
+        out, _ = self.o_proj(out)
+        return out
+
+
+def pixtral_rope_tables(
+    head_dim: int, max_side: int, theta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp32 ``[max_side**2, head_dim]`` cos/sin, indexed by ``row * max_side + col``.
+
+    The sign of the pair rotation lives in the sin table.
+    """
+    fc = pixtral.precompute_freqs_cis_2d(dim=head_dim, height=max_side, width=max_side, theta=theta)
+    cos = fc.real.repeat_interleave(2, dim=-1)
+    sin = torch.stack([-fc.imag, fc.imag], dim=-1).flatten(-2)
+    return cos.reshape(-1, head_dim), sin.reshape(-1, head_dim)
+
+
+def offset_major_merge_weight(weight: torch.Tensor, merge: int) -> torch.Tensor:
+    """``[D_out, D * merge**2]`` with ``unfold``'s ``(c, ki, kj)`` columns ->
+    ``[merge**2, D, D_out]``, one slice per offset block."""
+    out_dim, in_dim = weight.shape
+    return weight.reshape(out_dim, in_dim // merge**2, merge**2).permute(2, 1, 0).contiguous()
 
 
 def _linear_weight(layer: nn.Module) -> torch.Tensor:
@@ -67,13 +126,8 @@ def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
 
 
 class SpyrePixtralForConditionalGeneration(
-    SpyreVisionEncoderMixin, PixtralForConditionalGeneration
+    SpyreVisionEncoderMixin, pixtral.PixtralForConditionalGeneration
 ):
-    """Upstream Pixtral with Spyre attention and the three-graph vision encoder.
-
-    Processor, weight loading, placeholders and ``embed_input_ids`` are upstream's.
-    """
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_spyre_vision(prefix)
@@ -84,23 +138,21 @@ class SpyrePixtralForConditionalGeneration(
         self.rows_per_token = self._merge**2
         self.out_hidden_size = self.config.text_config.hidden_size
         self._max_side = args.image_size // args.patch_size
-        self.max_tokens_per_item = (self._max_side // self._merge) ** 2
         head_dim = args.hidden_size // args.num_attention_heads
         self._row_width = align_up(args.num_channels * args.patch_size**2)
         self.vision_buffers = {
             "rows": VisionBuffer(self._row_width),
-            # Padding rows get their own segment, so they never join an image's block.
-            "segments": VisionBuffer(STICK, pad=segment_pad_row(STICK)),
+            # One-hot image of each row; padding rows take the last column, their own image.
+            "segments": VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half()),
             "cos": VisionBuffer(head_dim),
             "sin": VisionBuffer(head_dim),
         }
-        # Host-only: the gather by position runs in input preparation.
         self._rope_cos, self._rope_sin = pixtral_rope_tables(
             head_dim, self._max_side, args.rope_theta
         )
 
-        # Text-only runs (image limit 0) get a placeholder tower.
-        if not isinstance(self.vision_encoder, VisionTransformer):
+        # Image limit 0 leaves a placeholder tower.
+        if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         for i, layer in enumerate(self.vision_encoder.transformer.layers):
             layer.attention = SpyrePixtralAttention(
@@ -110,8 +162,8 @@ class SpyrePixtralForConditionalGeneration(
             )
 
     def process_weights_after_loading(self) -> None:
-        # Runs on the host, before the runner moves the model to the card.
-        if not isinstance(self.vision_encoder, VisionTransformer):
+        # Host-side, before the runner moves the model to the card.
+        if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         tower = self.vision_encoder
         weight = tower.patch_conv.weight.detach().flatten(1)
@@ -123,17 +175,18 @@ class SpyrePixtralForConditionalGeneration(
             )
             self.patch_merger.register_buffer("spyre_merge_weight", merge_weight, persistent=False)
 
-    # --- upstream SupportsEncoderCudaGraph, model part (host) ---
+    # Upstream Pixtral does not implement SupportsEncoderCudaGraph, so these are ours.
+
+    def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        return "image"
+
+    def get_max_frames_per_video(self) -> int:
+        return 1
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
         p = self.vision_args.patch_size
-        specs = []
-        for img in _images(mm_kwargs):
-            rows = (img.shape[-2] // p) * (img.shape[-1] // p)
-            specs.append(
-                EncoderItemSpec(input_size=rows, output_tokens=rows // self.rows_per_token)
-            )
-        return specs
+        rows = [(img.shape[-2] // p) * (img.shape[-1] // p) for img in _images(mm_kwargs)]
+        return [EncoderItemSpec(input_size=n, output_tokens=n // self.rows_per_token) for n in rows]
 
     def select_encoder_cudagraph_items(
         self, mm_kwargs: dict[str, Any], indices: list[int]
@@ -148,27 +201,38 @@ class SpyrePixtralForConditionalGeneration(
         max_frames_per_batch: int,
         path: str = "default",
     ) -> EncoderCudaGraphReplayBuffers:
-        values = pixtral_patch_rows(
-            _images(mm_kwargs),
-            patch_size=self.vision_args.patch_size,
-            merge=self._merge,
-            max_side=self._max_side,
-            row_width=self._row_width,
-            segment_width=STICK,
-            cos_table=self._rope_cos,
-            sin_table=self._rope_sin,
-        )
+        """Offset-major patch rows of every image, flattened as ``(c, py, px)`` like the conv
+        weight, with each row's one-hot image and its gathered RoPE."""
+        images = _images(mm_kwargs)
+        assert len(images) < STICK, f"{len(images)} images in one call; at most {STICK - 1} fit"
+        p, m = self.vision_args.patch_size, self._merge
+        rows, seg, pos = [], [], []
+        for i, img in enumerate(images):
+            c, h, w = img.shape
+            assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
+            hp, wp = h // p, w // p
+            patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
+            rows.append(offset_major(patches.reshape(hp, wp, -1), m))
+            grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
+            pos.append(offset_major(grid, m))
+            seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
+        flat = torch.cat(rows, dim=1).flatten(0, 1).to(torch.float16)
+        positions = torch.cat(pos, dim=1).flatten()
+        values = {
+            "rows": F.pad(flat, (0, self._row_width - flat.shape[1])),
+            "segments": F.one_hot(torch.cat(seg, dim=1).flatten(), STICK).to(torch.float16),
+            "cos": self._rope_cos[positions].to(torch.float16),
+            "sin": self._rope_sin[positions].to(torch.float16),
+        }
         return EncoderCudaGraphReplayBuffers(values=dict(values))
-
-    # --- the three device graphs ---
 
     def vision_pre(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_encoder
         patch_weight_t = cast(torch.Tensor, tower.spyre_patch_weight_t)
         x = tower.ln_pre(torch.matmul(values["rows"], patch_weight_t).unsqueeze(0))
+        # A matmul, not a column-minus-row broadcast, which Spyre cannot lay out.
         segments = values["segments"]
-        same_image = torch.matmul(segments, segments.t())
-        mask = ((1.0 - same_image) * _MASK_MIN)[None, None]
+        mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
         return x, {"mask": mask, "freqs_cis": (values["cos"], values["sin"])}
 
     def vision_blocks(self) -> nn.ModuleList:
@@ -179,7 +243,6 @@ class SpyrePixtralForConditionalGeneration(
         if self.pre_mm_projector_norm is not None:
             x = self.pre_mm_projector_norm(x)
         if self.patch_merger is not None:
-            # Offset-major rows: one [tokens, D] block per merge offset, each with its slice.
             x = x.reshape(self.rows_per_token, -1, x.shape[-1])
             merge_weight = cast(torch.Tensor, self.patch_merger.spyre_merge_weight)
             x = torch.matmul(x, merge_weight).sum(dim=0)

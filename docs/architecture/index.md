@@ -259,7 +259,7 @@ grows with layer count.
 ## Vision encoders
 
 A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
-class with `SpyreVisionEncoderMixin` (`models/vision/base.py`) ahead of it. The mixin implements
+class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. The mixin implements
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
 `EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
 pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
@@ -278,18 +278,21 @@ The encoder is three graphs per budget, so all `n` blocks share one artifact:
 | blocks | `vision_blocks()` | upstream `TransformerBlock`s with `SpyrePixtralAttention` |
 | post | `vision_post(x)` | `pre_mm_projector_norm`, patch merge, `VisionLanguageAdapter` |
 
-A model also implements upstream's host-side methods `get_encoder_cudagraph_item_specs`,
-`select_encoder_cudagraph_items` and `prepare_encoder_cudagraph_replay_buffers`, and sets
-`vision_buffers`, `rows_per_token` (`M²` for an `M×M` merge), `max_tokens_per_item` and
-`out_hidden_size`. Everything else in the protocol, the eager (`enforce_eager`) path and the
-per-image output split come from the mixin. Upstream's processor, weight mapper, placeholders
-and `embed_input_ids` are inherited unchanged.
+A model also provides upstream's host-side `prepare_encoder_cudagraph_replay_buffers` and sets
+`vision_buffers`, `rows_per_token` (`M²` for an `M×M` merge) and `out_hidden_size`. Item specs,
+item selection and the modality come from the upstream class when it implements the protocol
+(Gemma 3/4, Qwen-VL); the mixin deliberately leaves them alone so it never shadows those.
+Upstream Pixtral does not implement it, so `SpyrePixtralForConditionalGeneration` writes its
+own. The rest of the protocol, the eager (`enforce_eager`) path and the per-image output split
+come from the mixin. Upstream's processor, weight mapper, placeholders and `embed_input_ids` are
+inherited unchanged.
 
 Constraints the layout follows:
 
-- Each budget's rows are rounded up to a whole number of 64-wide sticks, and the largest
-  budget must hold the largest image (`max_tokens_per_item`) or startup fails. There is no
-  eager fallback mid-request.
+- The largest budget is the largest image the model's upstream processor can produce
+  (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
+  uses), so no image needs a shape warmup skipped. Each budget's rows are rounded up to a
+  whole number of 64-wide sticks.
 - Rows are **offset-major**: one block per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`

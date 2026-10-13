@@ -35,11 +35,8 @@ MERGE = 2
 
 @pytest.fixture(autouse=True)
 def _engine_ir_dispatch():
-    """Trace vLLM IR ops (``RMSNorm``) inline, as the worker sets up for STOCK_TORCH_COMPILE.
-
-    Without a worker the IR torch-op wrapper stays on, and the compiled norm then
-    fails a torch-spyre layout check the engine never reaches.
-    """
+    """Trace vLLM IR ops such as ``RMSNorm`` inline, as the worker does under
+    STOCK_TORCH_COMPILE; the wrapped op fails a layout check the engine never reaches."""
     import vllm.ir
 
     with vllm.ir.enable_torch_wrap(False):
@@ -177,7 +174,8 @@ def test_padding_rows_do_not_leak_into_images(tp_group):
 
 def test_offset_major_merge_matches_upstream_merger(tp_group):
     """Offset-major rows times the per-offset weight equal ``unfold`` plus the original."""
-    from spyre_inference.models.vision.pixtral import offset_major, offset_major_merge_weight
+    from spyre_inference.models._vision_encoder import offset_major
+    from spyre_inference.models.pixtral import offset_major_merge_weight
 
     torch.manual_seed(2)
     hp, wp, d = 6, 4, 16
@@ -193,8 +191,8 @@ def test_offset_major_merge_matches_upstream_merger(tp_group):
 
 
 def test_rope_tables_match_upstream_complex_rope():
-    from spyre_inference.models.vision.pixtral import pixtral_rope_tables
-    from spyre_inference.multimodal.utils import rope_perm_matrix, rope_rotate_matmul
+    from spyre_inference.models.pixtral import pixtral_rope_tables
+    from spyre_inference.multimodal.utils import pair_swap_matrix, rope_rotate_matmul
 
     head_dim, side = 64, 16
     cos, sin = pixtral_rope_tables(head_dim, side, 10000.0)
@@ -205,7 +203,7 @@ def test_rope_tables_match_upstream_complex_rope():
     want_q, want_k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs)
 
     flat = rows * side + cols
-    perm = rope_perm_matrix("pair", head_dim).float()
+    perm = pair_swap_matrix(head_dim).float()
     c, s = cos[flat][None, :, None], sin[flat][None, :, None]
     torch.testing.assert_close(rope_rotate_matmul(q, c, s, perm), want_q, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(rope_rotate_matmul(k, c, s, perm), want_k, atol=1e-5, rtol=1e-5)
@@ -268,11 +266,7 @@ def test_pipeline_matches_upstream_on_spyre(tp_group):
 @pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 @pytest.mark.parametrize("token_budget", [32, 64])
 def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
-    """The three compiled graphs at one bucket, fed the way the manager feeds them.
-
-    Compiled vision attention is what the strict-xfail coarse-tile probe says fails for
-    the old patch; this block keeps the RoPE gather and the mask build out of the graph.
-    """
+    """The three compiled graphs at one bucket, fed the way the manager feeds them."""
     from spyre_inference.custom_ops.utils import convert
 
     args = _args()
