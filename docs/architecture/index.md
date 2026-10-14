@@ -290,6 +290,10 @@ kernels, so the compile guard covers the vision graphs. Upstream's
 `GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
 the embedding merge, encoder cache and decoder are unchanged.
 
+![Vision encoder](multimodal-vision-encoder.svg)
+
+Its source is `multimodal-vision-encoder.d2`; regenerate it from `docs/architecture/` with `d2 --layout elk --pad 40 multimodal-vision-encoder.d2 multimodal-vision-encoder.svg`.
+
 Adding a model means one file in `models/` (plus its `_ADAPTED_ARCHS` entry): the subclass
 implements the hooks below and nothing in the runner or manager changes. The units follow
 upstream: an *image token* is one position of `vision_project`'s output, counted by upstream's token
