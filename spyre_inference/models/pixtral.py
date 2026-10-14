@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native Mistral-format Pixtral (e.g. Ministral-3) with a compiled, bucketed vision tower.
+"""Native Mistral-format Pixtral (e.g. Ministral-3) with a compiled, bucketed vision encoder.
 
-Patches are laid out offset-major (see ``offset_major``). The tower is
-permutation-equivariant while RoPE positions and the image mask follow the patches, so the
-reorder only changes how the patch merge lowers.
+``SpyrePixtralForConditionalGeneration`` keeps upstream's processor, weight loading and
+decoder, and adds the ``SpyreVisionEncoderMixin`` hooks:
+
+- attention: ``SpyrePixtralAttention``, with RoPE as a matmul and the stick-aligned SDPA;
+- inputs: patches laid out offset-major on the host, with each patch's image and RoPE;
+- patch embedding: the conv folded into a linear at load time;
+- patch merge: a batched matmul over the offset groups, in place of upstream's ``unfold``.
+
+The encoder is permutation-equivariant while RoPE and the image mask follow the patches, so
+the offset-major order changes how the merge lowers, not the result.
 """
 
 from __future__ import annotations
@@ -52,9 +59,10 @@ _MASK_MIN = torch.finfo(torch.float16).min / 2
 
 
 class SpyrePixtralAttention(pixtral.Attention):
-    """Upstream's attention with a matmul RoPE and the stick-aligned SDPA.
+    """Upstream's vision attention with RoPE as a matmul and the stick-aligned SDPA.
 
-    ``freqs_cis`` is a ``(cos, sin)`` pair gathered on the host: Spyre has no complex dtype.
+    ``freqs_cis`` is a ``(cos, sin)`` pair gathered on the host instead of upstream's complex
+    table, since Spyre has no complex dtype.
     """
 
     rope_perm: torch.Tensor
@@ -87,9 +95,10 @@ class SpyrePixtralAttention(pixtral.Attention):
 def pixtral_rope_tables(
     head_dim: int, max_side: int, theta: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """fp32 ``[max_side**2, head_dim]`` cos/sin, indexed by ``row * max_side + col``.
+    """fp32 ``[max_side**2, head_dim]`` cos and sin tables, indexed by ``row * max_side + col``.
 
-    The sign of the pair rotation lives in the sin table.
+    The sin table carries the pair rotation's sign, so ``rope_rotate_matmul`` reproduces
+    upstream's complex multiply.
     """
     fc = pixtral.precompute_freqs_cis_2d(dim=head_dim, height=max_side, width=max_side, theta=theta)
     cos = fc.real.repeat_interleave(2, dim=-1)
@@ -98,8 +107,8 @@ def pixtral_rope_tables(
 
 
 def offset_major_merge_weight(weight: torch.Tensor, merge: int) -> torch.Tensor:
-    """``[D_out, D * merge**2]`` with ``unfold``'s ``(c, ki, kj)`` columns ->
-    ``[merge**2, D, D_out]``, one slice per offset block."""
+    """The merging layer's ``[D_out, D * merge**2]`` weight (columns in ``unfold``'s
+    ``(c, ki, kj)`` order) as ``[merge**2, D, D_out]``, one slice per offset group."""
     out_dim, in_dim = weight.shape
     return weight.reshape(out_dim, in_dim // merge**2, merge**2).permute(2, 1, 0).contiguous()
 
@@ -115,6 +124,7 @@ def _linear_weight(layer: nn.Module) -> torch.Tensor:
 
 
 def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+    """The ``[C, H, W]`` images in ``mm_kwargs``, whether batched in one tensor or a list."""
     images = mm_kwargs.get("images")
     if images is None:
         return []
@@ -124,14 +134,20 @@ def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
 class SpyrePixtralForConditionalGeneration(
     SpyreVisionEncoderMixin, pixtral.PixtralForConditionalGeneration
 ):
-    # One-hot segments: the last column is the padding slots' own image.
+    """Upstream Pixtral with its vision encoder compiled per token budget."""
+
+    # The one-hot image matrix is 64 wide, and its last column belongs to the padding.
     vision_max_items_per_call = STICK - 1
+
+    # --- construction ---
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_spyre_vision(prefix)
 
     def _init_spyre_vision(self, prefix: str) -> None:
+        """Set the mixin's attributes and swap in Spyre attention. Separate from ``__init__``
+        so tests can run it on upstream modules without a full ``VllmConfig``."""
         args = self.vision_args
         self._merge = args.spatial_merge_size if self.patch_merger is not None else 1
         self.patches_per_token = self._merge**2
@@ -149,7 +165,7 @@ class SpyrePixtralForConditionalGeneration(
             head_dim, self._max_side, args.rope_theta
         )
 
-        # Image limit 0 leaves a placeholder tower.
+        # With an image limit of 0, upstream leaves a placeholder instead of the tower.
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         for i, layer in enumerate(self.vision_encoder.transformer.layers):
@@ -160,7 +176,8 @@ class SpyrePixtralForConditionalGeneration(
             )
 
     def process_weights_after_loading(self) -> None:
-        # Host-side, before the runner moves the model to the card.
+        """Reshape the patch-conv and merging weights for the vision graphs. Runs on the host,
+        before the runner moves the model to the card."""
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         tower = self.vision_encoder
@@ -173,13 +190,21 @@ class SpyrePixtralForConditionalGeneration(
             )
             self.patch_merger.register_buffer("spyre_merge_weight", merge_weight, persistent=False)
 
-    # Upstream Pixtral does not implement SupportsEncoderCudaGraph, so these are ours.
+    # --- protocol methods upstream Pixtral does not provide ---
 
     def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
         return "image"
 
     def get_max_frames_per_video(self) -> int:
         return 1
+
+    def select_encoder_cudagraph_items(
+        self, mm_kwargs: dict[str, Any], indices: list[int]
+    ) -> dict[str, Any]:
+        images = _images(mm_kwargs)
+        return {**mm_kwargs, "images": [images[i] for i in indices]}
+
+    # --- SpyreVisionEncoderMixin hooks ---
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
         p = self.vision_args.patch_size
@@ -188,15 +213,9 @@ class SpyrePixtralForConditionalGeneration(
             for img in _images(mm_kwargs)
         ]
 
-    def select_encoder_cudagraph_items(
-        self, mm_kwargs: dict[str, Any], indices: list[int]
-    ) -> dict[str, Any]:
-        images = _images(mm_kwargs)
-        return {**mm_kwargs, "images": [images[i] for i in indices]}
-
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Offset-major patches of every image, flattened as ``(c, py, px)`` like the conv
-        weight, with each patch's one-hot image and its gathered RoPE."""
+        """Offset-major patches of every image, each flattened as ``(c, py, px)`` like the conv
+        weight, with its one-hot image and its RoPE cos and sin."""
         images = _images(mm_kwargs)
         p, m = self.vision_args.patch_size, self._merge
         flat_patches, seg, pos = [], [], []
@@ -222,7 +241,7 @@ class SpyrePixtralForConditionalGeneration(
         tower = self.vision_encoder
         patch_weight_t = cast(torch.Tensor, tower.spyre_patch_weight_t)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
-        # A matmul, not a column-minus-row broadcast, which Spyre cannot lay out.
+        # Same-image mask as a matmul: Spyre cannot lay out a column-minus-row broadcast.
         segments = values["segments"]
         mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
         return x, {"mask": mask, "freqs_cis": (values["cos"], values["sin"])}
@@ -235,6 +254,7 @@ class SpyrePixtralForConditionalGeneration(
         if self.pre_mm_projector_norm is not None:
             x = self.pre_mm_projector_norm(x)
         if self.patch_merger is not None:
+            # One [tokens, D] group per merge offset, each with its slice of the weight.
             x = x.reshape(self.patches_per_token, -1, x.shape[-1])
             merge_weight = cast(torch.Tensor, self.patch_merger.spyre_merge_weight)
             x = torch.matmul(x, merge_weight).sum(dim=0)

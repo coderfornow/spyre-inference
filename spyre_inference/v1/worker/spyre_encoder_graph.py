@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Upstream's encoder budget manager, compiling each budget at warmup instead of
-capturing a CUDA graph. Budgets, packing, padding and the per-item split are upstream's."""
+"""Upstream's vision encoder budget manager, with compiled graphs in place of CUDA graphs."""
 
 from __future__ import annotations
 
@@ -36,6 +35,14 @@ logger = init_logger(__name__)
 
 
 class SpyreEncoderGraphManager(EncoderCudaGraphManager):
+    """Compiles the encoder at each token budget during warmup, then serves through it.
+
+    Inherited from upstream: budget selection and user overrides, packing items into budgets,
+    replay padding, and the per-item output split. Overridden: capture compiles the model's
+    graphs at that budget's static shape, and replay copies the inputs into host staging
+    buffers, uploads them once and runs those graphs.
+    """
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -44,12 +51,13 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         model: SpyreVisionEncoderMixin,
     ) -> None:
         super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
+        # Tensor parallelism only: the encoder runs on the decoder's ranks.
         if self.use_dp:
             raise NotImplementedError(
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
-        # Every padded patch count must be a whole number of vision_patch_multiple.
+        # Round every budget up so its patch count is a whole vision_patch_multiple.
         step = model.vision_patch_multiple // model.patches_per_token
 
         def aligned(budgets: list[int]) -> list[int]:
@@ -57,6 +65,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
         self.token_budgets = aligned(self.token_budgets)
         self.path_token_budgets = {p: aligned(b) for p, b in self.path_token_budgets.items()}
+        # Fail at startup rather than compile mid-request when user budgets miss an item.
         largest_item = model.get_encoder_cudagraph_budget_range(vllm_config)[1]
         if self.token_budgets[-1] < largest_item:
             raise ValueError(
@@ -64,11 +73,13 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 f"item ({largest_item} tokens), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
+        # Respect a layout limit on items per encoder call when packing.
         if model.vision_max_items_per_call is not None:
             self.max_batch_size = min(self.max_batch_size, model.vision_max_items_per_call)
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
     def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
+        """Compile the encoder at this budget, keeping its host buffers for replay."""
         values = self.model.prepare_encoder_cudagraph_capture_inputs(
             token_budget,
             self.max_batch_size,
@@ -89,6 +100,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         token_budget: int,
         path: str = "default",
     ) -> torch.Tensor | None:
+        """Run one packed batch through the budget's compiled graphs; ``None`` if uncompiled."""
         staging = self._staging.get(path, {}).get(token_budget)
         num_items = len(self._get_item_specs(mm_kwargs))
         if staging is None:
@@ -98,7 +110,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path
         )
         for key, buf in staging.items():
-            # The mixin's replay buffers are validated: every key present, none None.
+            # The mixin validates replay buffers: every key is present and none is None.
             self.config.padding_logics[key](buf, cast(torch.Tensor, replay.values[key]))
         with torch.inference_mode():
             output = self.model.encoder_cudagraph_forward(self._upload(staging), path=path)
@@ -106,4 +118,5 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         return output
 
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Copy host buffers to the encoder's device."""
         return {key: convert(value, device=self.device) for key, value in values.items()}
