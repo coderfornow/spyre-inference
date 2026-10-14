@@ -418,22 +418,31 @@ def test_patched_rms_norm_stays_in_input_dtype_and_matches_reference():
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
 
+# The dispatch key, so the name has to match upstream's exactly.
+class Gemma4VisionModel(torch.nn.Module):
+    pass
+
+
+def _stub_vision_applies(monkeypatch) -> list[str]:
+    from spyre_inference import multimodal
+
+    called: list[str] = []
+    for name in ("gemma4_vision", "pixtral", "clip"):
+        monkeypatch.setattr(
+            getattr(multimodal, name),
+            "apply",
+            lambda *a, _name=name: called.append(_name),
+            raising=True,
+        )
+    return called
+
+
 def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     """`apply_multimodal_patches` keys on the tower's class name, since Pixtral and
     Gemma 4 both hang their tower off a `vision_tower` attribute."""
     from spyre_inference import multimodal
 
-    called = []
-    monkeypatch.setattr(
-        multimodal.gemma4_vision, "apply", lambda *a: called.append("gemma4"), raising=True
-    )
-    monkeypatch.setattr(
-        multimodal.pixtral, "apply", lambda *a: called.append("pixtral"), raising=True
-    )
-
-    # The name is the dispatch key, so it has to match upstream's exactly.
-    class Gemma4VisionModel(torch.nn.Module):
-        pass
+    called = _stub_vision_applies(monkeypatch)
 
     class _PixtralTower(torch.nn.Module):
         pass
@@ -441,7 +450,7 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     gemma4_model = torch.nn.Module()
     gemma4_model.vision_tower = Gemma4VisionModel()
     multimodal.apply_multimodal_patches(gemma4_model, torch.device("cpu"))
-    assert called == ["gemma4"]
+    assert called == ["gemma4_vision"]
 
     called.clear()
     pixtral_model = torch.nn.Module()
@@ -452,6 +461,28 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     called.clear()
     multimodal.apply_multimodal_patches(torch.nn.Module(), torch.device("cpu"))
     assert called == [], "a text-only model must get no vision patches"
+
+
+def test_dispatch_skips_a_stage_missing_tower(monkeypatch):
+    """With every modality limited to 0, vLLM builds the tower on the meta device behind
+    a `StageMissingLayer` that forwards attribute reads but must never run: its class
+    name is not the tower's, and there are no weights to patch."""
+    from vllm.model_executor.models.utils import StageMissingLayer
+
+    from spyre_inference import multimodal
+
+    called = _stub_vision_applies(monkeypatch)
+
+    gemma4_model = torch.nn.Module()
+    gemma4_model.vision_tower = StageMissingLayer("vision_tower", Gemma4VisionModel())
+    multimodal.apply_multimodal_patches(gemma4_model, torch.device("cpu"))
+
+    clip_model = torch.nn.Module()
+    clip_model.config = SimpleNamespace(model_type="clip")
+    clip_model.vision_model = StageMissingLayer("vision_tower", torch.nn.Module())
+    multimodal.apply_multimodal_patches(clip_model, torch.device("cpu"))
+
+    assert called == [], "a stage-skipped tower must get no vision patches"
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +999,7 @@ def test_patched_encoder_refuses_to_pad_its_own_weights():
     unpadded tower has to say so instead of mutating itself mid-trace."""
     from spyre_inference.multimodal import gemma4_vision
 
+    gemma4_vision.patch_vision_attention()
     gemma4_vision.patch_vision_encoder()
     encoder = _encoder()
     embeds, mask, pos = _encoder_inputs()
@@ -994,8 +1026,6 @@ def test_patched_attention_refuses_an_unpadded_instance():
 
 
 def test_pad_vision_weights_pads_every_layer():
-    """`pad_vision_weights` reaches the layers through the tower, as `apply()` hands it
-    the whole model."""
     encoder = _encoder(num_layers=3)
     _load(encoder)
 
