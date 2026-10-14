@@ -218,7 +218,7 @@ class SpyrePixtralForConditionalGeneration(
             "sin": self._rope_sin[positions].to(torch.float16),
         }
 
-    def vision_pre(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
+    def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_encoder
         patch_weight_t = cast(torch.Tensor, tower.spyre_patch_weight_t)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
@@ -230,7 +230,7 @@ class SpyrePixtralForConditionalGeneration(
     def vision_blocks(self) -> nn.ModuleList:
         return self.vision_encoder.transformer.layers
 
-    def vision_post(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
+    def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
         x = x.squeeze(0)
         if self.pre_mm_projector_norm is not None:
             x = self.pre_mm_projector_norm(x)

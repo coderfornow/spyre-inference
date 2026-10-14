@@ -16,7 +16,7 @@
 
 A model mixes ``SpyreVisionEncoderMixin`` in ahead of its upstream class and implements only
 the ``vision_*`` hooks below; the protocol, warmup and serving are generic. Units: an encoder
-*image token* is one position of ``vision_post``'s output, the unit of upstream's token
+*image token* is one position of ``vision_project``'s output, the unit of upstream's token
 budgets; host inputs hold one entry per *patch*, ``patches_per_token`` per image token.
 """
 
@@ -93,7 +93,7 @@ class SpyreVisionEncoderMixin:
     vision_buffers: dict[str, VisionBuffer]
     # Patches per image token: the merge or pool factor (``M**2``), 1 if none.
     patches_per_token: int
-    # Width of ``vision_post``'s output: the text model's hidden size, as the merge expects.
+    # Width of ``vision_project``'s output: the text model's hidden size, as the merge expects.
     out_hidden_size: int
 
     # --- required hooks ---
@@ -102,7 +102,7 @@ class SpyreVisionEncoderMixin:
         """Image tokens each item will produce, in item order.
 
         Implement from the item shapes in ``mm_kwargs`` (host-only, no tensor reads on the
-        card). These are positions of ``vision_post``'s output, the unit of upstream's token
+        card). These are positions of ``vision_project``'s output, the unit of upstream's token
         budgets, so ``sum(tokens) * patches_per_token`` must equal the patch count
         ``vision_inputs`` returns for the same items.
         """
@@ -114,17 +114,18 @@ class SpyreVisionEncoderMixin:
         Implement on the host: one fp16 tensor per ``vision_buffers`` key, all with the same
         patch count and no padding (the mixin pads to a budget). Lay patches out in
         ``vision_pad_groups`` equal blocks (offset-major, see ``offset_major``) when
-        ``vision_post`` merges or pools. Put anything data-dependent here (patching, position
+        ``vision_project`` merges or pools. Put anything data-dependent here (patching, position
         gathers, segment ids): the device graphs must depend on shapes only.
         """
         raise NotImplementedError
 
-    def vision_pre(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Graph 1, compiled per budget: the padded device buffers -> ``(x, block_kwargs)``.
+    def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Graph 1, compiled per budget: patches -> the blocks' input embeddings.
 
-        Implement the steps before the repeated blocks (patch embedding, norms, the attention
-        mask) on device tensors of static shape. ``block_kwargs`` is passed to every block
-        through ``vision_call_block``.
+        Implement the patch embedding and anything else before the repeated blocks (norms),
+        on device tensors of static shape, returning ``(x, block_kwargs)``. ``block_kwargs``
+        holds the inputs every block shares (the attention mask, RoPE) and is passed to each
+        block through ``vision_call_block``.
         """
         raise NotImplementedError
 
@@ -136,8 +137,9 @@ class SpyreVisionEncoderMixin:
         """
         raise NotImplementedError
 
-    def vision_post(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
-        """Graph 3, compiled per budget: the last block's output -> ``[tokens, out_hidden_size]``.
+    def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
+        """Graph 3, compiled per budget: the last block's output projected into the text model's
+        space, ``[tokens, out_hidden_size]``.
 
         Implement the steps after the blocks (merge or pool, projector). ``taps`` holds the
         hidden states named by ``vision_taps``, in that order. Padding tokens may stay in the
@@ -149,7 +151,7 @@ class SpyreVisionEncoderMixin:
     # Modalities run through the compiled graphs; any other goes to upstream's
     # embed_multimodal.
     vision_modalities: ClassVar[tuple[str, ...]] = ("image",)
-    # Hidden states kept for vision_post: 0 is vision_pre's output, i the output of block i,
+    # Hidden states kept for vision_project: 0 is vision_embed's output, i the output of block i,
     # negative indices count from the last block.
     vision_taps: ClassVar[tuple[int, ...]] = ()
     # Most items one encoder call can carry, when the layout bounds it (e.g. a one-hot width).
@@ -164,7 +166,7 @@ class SpyreVisionEncoderMixin:
     def vision_pad_groups(self) -> int:
         """Equal groups every buffer's patches are split into, each padded at its own tail.
 
-        Default ``patches_per_token``: one block per merge offset, so ``vision_post`` merges with
+        Default ``patches_per_token``: one block per merge offset, so ``vision_project`` merges with
         a free view. Override with 1 when items pad as whole units at the tail (e.g. tiles).
         """
         return self.patches_per_token
@@ -192,13 +194,13 @@ class SpyreVisionEncoderMixin:
     # --- generic machinery: models do not override these ---
 
     def compile_vision_graphs(self) -> None:
-        """Wrap ``vision_pre``, every block and ``vision_post`` in static-shape compiles and
+        """Wrap ``vision_embed``, every block and ``vision_project`` in static-shape compiles and
         register them with the compile guard. Called once by the runner at warmup."""
         compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
-        self._spyre_vision_pre = torch.compile(self.vision_pre, **compile_kwargs)
-        self._spyre_vision_post = torch.compile(self.vision_post, **compile_kwargs)
-        compile_guard.watch(self._spyre_vision_pre, f"{type(self).__name__}.vision_pre")
-        compile_guard.watch(self._spyre_vision_post, f"{type(self).__name__}.vision_post")
+        self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
+        self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
+        compile_guard.watch(self._spyre_vision_embed, f"{type(self).__name__}.vision_embed")
+        compile_guard.watch(self._spyre_vision_project, f"{type(self).__name__}.vision_project")
         for block in self.vision_blocks():
             block.compile(**compile_kwargs)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
@@ -285,24 +287,24 @@ class SpyreVisionEncoderMixin:
     def encoder_cudagraph_forward(
         self, inputs: dict[str, torch.Tensor], path: str = "default"
     ) -> torch.Tensor:
-        """Run the encoder on padded device buffers: ``vision_pre``, every block, collecting
-        ``vision_taps``, then ``vision_post``, compiled after ``compile_vision_graphs``.
+        """Run the encoder on padded device buffers: ``vision_embed``, every block, collecting
+        ``vision_taps``, then ``vision_project``, compiled after ``compile_vision_graphs``.
 
         Returns the output on the host in one copy: device views at offsets off the stick
         read as offset 0 (torch-spyre#3770), and the embedding merge runs on the host anyway.
         """
-        pre = getattr(self, "_spyre_vision_pre", self.vision_pre)
-        post = getattr(self, "_spyre_vision_post", self.vision_post)
+        embed = getattr(self, "_spyre_vision_embed", self.vision_embed)
+        project = getattr(self, "_spyre_vision_project", self.vision_project)
         blocks = self.vision_blocks()
         depth = len(blocks) + 1
         wanted = {t % depth for t in self.vision_taps}
-        x, block_kwargs = pre(inputs)
+        x, block_kwargs = embed(inputs)
         hidden = {0: x} if 0 in wanted else {}
         for i, block in enumerate(blocks, start=1):
             x = self.vision_call_block(block, x, block_kwargs)
             if i in wanted:
                 hidden[i] = x
-        return convert(post(x, [hidden[t % depth] for t in self.vision_taps]), device="cpu")
+        return convert(project(x, [hidden[t % depth] for t in self.vision_taps]), device="cpu")
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"

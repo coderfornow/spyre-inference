@@ -72,13 +72,13 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         seg = seg.repeat(MERGE_PATCHES).to(torch.float16)
         return {"patches": seg[:, None].expand(-1, 8).contiguous(), "segments": seg}
 
-    def vision_pre(self, values):
+    def vision_embed(self, values):
         return values["patches"], {"offset": 0.0}
 
     def vision_blocks(self):
         return self.blocks
 
-    def vision_post(self, x, taps):
+    def vision_project(self, x, taps):
         self.forward_patches.append(x.shape[0])
         self.seen_taps.append(taps)
         return x.reshape(MERGE_PATCHES, -1, x.shape[-1]).mean(dim=0)
@@ -179,7 +179,7 @@ def test_items_per_call_cap_splits_the_batch():
     assert [o.shape[0] for o in outputs] == [10, 30]
 
 
-def test_taps_reach_vision_post_in_declared_order():
+def test_taps_reach_vision_project_in_declared_order():
     model = _FakeVisionModel(num_blocks=3)
     type(model).vision_taps = (-1, 0, 2)
     try:

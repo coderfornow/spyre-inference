@@ -272,7 +272,7 @@ the embedding merge, encoder cache and decoder are unchanged.
 
 Adding a model means one file in `models/` (plus its `_ADAPTED_ARCHS` entry): the subclass
 implements the hooks below and nothing in the runner or manager changes. The units follow
-upstream: an *image token* is one position of `vision_post`'s output, counted by upstream's token
+upstream: an *image token* is one position of `vision_project`'s output, counted by upstream's token
 budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
 `patches_per_token` per image token.
 
@@ -281,11 +281,11 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | fp16 host inputs and their padding values; patches per image token; output width | patches, one-hot segments, cos, sin; `M²`; text hidden size |
 | `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
 | `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, gathered RoPE |
-| `vision_pre(values)` | yes | graph 1: `-> (x, block_kwargs)` | patch linear, `ln_pre`, image mask |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
 | `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
-| `vision_post(x, taps)` | yes | graph 3: `-> [tokens, out_hidden_size]` | projector norm, patch merge, adapter |
+| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter |
 | `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
-| `vision_taps` | no | intermediate hidden states passed to `vision_post` | none |
+| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
