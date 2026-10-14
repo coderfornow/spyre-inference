@@ -49,8 +49,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
-        # Every L must be a whole number of the model's row quantum.
-        step = model.vision_row_quantum // model.rows_per_token
+        # Every padded patch count must be a whole number of vision_patch_multiple.
+        step = model.vision_patch_multiple // model.patches_per_token
 
         def aligned(budgets: list[int]) -> list[int]:
             return sorted({-(-b // step) * step if b > 0 else b for b in budgets})
@@ -61,7 +61,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         if self.token_budgets[-1] < largest_item:
             raise ValueError(
                 f"largest encoder budget {self.token_budgets[-1]} is below the largest "
-                f"item ({largest_item} rows), which would then compile "
+                f"item ({largest_item} tokens), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
         if model.vision_max_items_per_call is not None:

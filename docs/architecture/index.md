@@ -271,29 +271,30 @@ kernels, so the compile guard covers the vision graphs. Upstream's
 the embedding merge, encoder cache and decoder are unchanged.
 
 Adding a model means one file in `models/` (plus its `_ADAPTED_ARCHS` entry): the subclass
-implements the hooks below and nothing in the runner or manager changes. An encoder *row* is
-one row of `vision_post`'s output; upstream's token budgets and `EncoderItemSpec.output_tokens`
-count these rows, and host inputs have `rows_per_token` rows per output row.
+implements the hooks below and nothing in the runner or manager changes. The units follow
+upstream: an *image token* is one position of `vision_post`'s output, counted by upstream's token
+budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
+`patches_per_token` per image token.
 
 | Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) |
 |---|---|---|---|
-| `vision_buffers`, `rows_per_token`, `out_hidden_size` | yes | fp16 host inputs and their padding rows; input rows per output row; output width | patch rows, one-hot segments, cos, sin; `M²`; text hidden size |
-| `vision_item_rows(mm_kwargs)` | yes | encoder rows per item, for packing into budgets | patches / `M²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major rows, segments, gathered RoPE |
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | fp16 host inputs and their padding values; patches per image token; output width | patches, one-hot segments, cos, sin; `M²`; text hidden size |
+| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, gathered RoPE |
 | `vision_pre(values)` | yes | graph 1: `-> (x, block_kwargs)` | patch linear, `ln_pre`, image mask |
 | `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
-| `vision_post(x, taps)` | yes | graph 3: `-> [rows, out_hidden_size]` | projector norm, patch merge, adapter |
+| `vision_post(x, taps)` | yes | graph 3: `-> [tokens, out_hidden_size]` | projector norm, patch merge, adapter |
 | `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
 | `vision_taps` | no | intermediate hidden states passed to `vision_post` | none |
-| `vision_row_blocks`, `vision_row_quantum` | no | padding layout and alignment (default: offset blocks, 64-row sticks) | default |
+| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
 as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
-differ from encoder rows (unpadding, newline rows; its input is already on the host), and
-`get_encoder_cudagraph_budget_range` when the processor's largest item is not counted in encoder
-rows. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
+differ from the encoder's image tokens (unpadding, newline tokens; its input is already on the
+host), and `get_encoder_cudagraph_budget_range` when the processor's largest item is not counted
+in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
 upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. The eager
@@ -305,19 +306,19 @@ Constraints the layout follows:
 - The largest budget is the largest item the model's upstream processor can produce
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
   uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
-  warmup skipped. Each budget is a whole number of `vision_row_quantum` rows.
-- Rows are **offset-major**: one block per offset inside a merge group, each padded at
+  warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+- Patches are **offset-major**: one group per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
   reshape feeding a matmul cannot be laid out.
 - The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
-  column reserved for padding rows), not a column-minus-row broadcast, which torch-spyre
+  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
   cannot lay out.
 - RoPE cos/sin are gathered by position on the host and enter as graph inputs; the rotation is
   a matmul against a constant pair-swap matrix, since a 64-wide head's 32-wide halves cannot
   be sliced.
 - The encoder output comes back to the host in one copy and is sliced there: device views
-  at row offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
+  at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
   runs on the host anyway.
 - Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
 

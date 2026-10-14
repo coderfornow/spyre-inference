@@ -1021,7 +1021,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if model is None:
             return None
         # The processor's largest item, as upstream computes it for the scheduler's encoder
-        # budget; a model whose encoder rows differ overrides its budget range.
+        # budget; a model whose encoder tokens differ overrides its budget range.
         assert self.mm_budget is not None
         model.max_tokens_per_item = max(
             self.mm_budget.mm_max_toks_per_item[m] for m in model.vision_modalities

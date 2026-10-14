@@ -14,8 +14,8 @@
 
 """Native Mistral-format Pixtral (e.g. Ministral-3) with a compiled, bucketed vision tower.
 
-Patch rows are laid out offset-major (see ``offset_major``). The tower is
-permutation-equivariant while RoPE positions and the image mask follow the rows, so the
+Patches are laid out offset-major (see ``offset_major``). The tower is
+permutation-equivariant while RoPE positions and the image mask follow the patches, so the
 reorder only changes how the patch merge lowers.
 """
 
@@ -124,7 +124,7 @@ def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
 class SpyrePixtralForConditionalGeneration(
     SpyreVisionEncoderMixin, pixtral.PixtralForConditionalGeneration
 ):
-    # One-hot segments: the last column is the padding rows' own image.
+    # One-hot segments: the last column is the padding slots' own image.
     vision_max_items_per_call = STICK - 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -134,13 +134,13 @@ class SpyrePixtralForConditionalGeneration(
     def _init_spyre_vision(self, prefix: str) -> None:
         args = self.vision_args
         self._merge = args.spatial_merge_size if self.patch_merger is not None else 1
-        self.rows_per_token = self._merge**2
+        self.patches_per_token = self._merge**2
         self.out_hidden_size = self.config.text_config.hidden_size
         self._max_side = args.image_size // args.patch_size
         head_dim = args.hidden_size // args.num_attention_heads
-        self._row_width = align_up(args.num_channels * args.patch_size**2)
+        self._patch_width = align_up(args.num_channels * args.patch_size**2)
         self.vision_buffers = {
-            "rows": VisionBuffer(self._row_width),
+            "patches": VisionBuffer(self._patch_width),
             "segments": VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half()),
             "cos": VisionBuffer(head_dim),
             "sin": VisionBuffer(head_dim),
@@ -165,7 +165,7 @@ class SpyrePixtralForConditionalGeneration(
             return
         tower = self.vision_encoder
         weight = tower.patch_conv.weight.detach().flatten(1)
-        weight_t = F.pad(weight, (0, self._row_width - weight.shape[1])).t().contiguous()
+        weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
         tower.register_buffer("spyre_patch_weight_t", weight_t, persistent=False)
         if self.patch_merger is not None:
             merge_weight = offset_major_merge_weight(
@@ -181,10 +181,10 @@ class SpyrePixtralForConditionalGeneration(
     def get_max_frames_per_video(self) -> int:
         return 1
 
-    def vision_item_rows(self, mm_kwargs: dict[str, Any]) -> list[int]:
+    def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
         p = self.vision_args.patch_size
         return [
-            (img.shape[-2] // p) * (img.shape[-1] // p) // self.rows_per_token
+            (img.shape[-2] // p) * (img.shape[-1] // p) // self.patches_per_token
             for img in _images(mm_kwargs)
         ]
 
@@ -195,24 +195,24 @@ class SpyrePixtralForConditionalGeneration(
         return {**mm_kwargs, "images": [images[i] for i in indices]}
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Offset-major patch rows of every image, flattened as ``(c, py, px)`` like the conv
-        weight, with each row's one-hot image and its gathered RoPE."""
+        """Offset-major patches of every image, flattened as ``(c, py, px)`` like the conv
+        weight, with each patch's one-hot image and its gathered RoPE."""
         images = _images(mm_kwargs)
         p, m = self.vision_args.patch_size, self._merge
-        rows, seg, pos = [], [], []
+        flat_patches, seg, pos = [], [], []
         for i, img in enumerate(images):
             c, h, w = img.shape
             assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
             hp, wp = h // p, w // p
             patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
-            rows.append(offset_major(patches.reshape(hp, wp, -1), m))
+            flat_patches.append(offset_major(patches.reshape(hp, wp, -1), m))
             grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
             pos.append(offset_major(grid, m))
             seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
-        flat = torch.cat(rows, dim=1).flatten(0, 1).to(torch.float16)
+        flat = torch.cat(flat_patches, dim=1).flatten(0, 1).to(torch.float16)
         positions = torch.cat(pos, dim=1).flatten()
         return {
-            "rows": F.pad(flat, (0, self._row_width - flat.shape[1])),
+            "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
             "segments": F.one_hot(torch.cat(seg, dim=1).flatten(), STICK).to(torch.float16),
             "cos": self._rope_cos[positions].to(torch.float16),
             "sin": self._rope_sin[positions].to(torch.float16),
@@ -221,7 +221,7 @@ class SpyrePixtralForConditionalGeneration(
     def vision_pre(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_encoder
         patch_weight_t = cast(torch.Tensor, tower.spyre_patch_weight_t)
-        x = tower.ln_pre(torch.matmul(values["rows"], patch_weight_t).unsqueeze(0))
+        x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
         # A matmul, not a column-minus-row broadcast, which Spyre cannot lay out.
         segments = values["segments"]
         mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
@@ -235,7 +235,7 @@ class SpyrePixtralForConditionalGeneration(
         if self.pre_mm_projector_norm is not None:
             x = self.pre_mm_projector_norm(x)
         if self.patch_merger is not None:
-            x = x.reshape(self.rows_per_token, -1, x.shape[-1])
+            x = x.reshape(self.patches_per_token, -1, x.shape[-1])
             merge_weight = cast(torch.Tensor, self.patch_merger.spyre_merge_weight)
             x = torch.matmul(x, merge_weight).sum(dim=0)
         return self.vision_language_adapter(x)

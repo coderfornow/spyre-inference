@@ -25,7 +25,7 @@ import torch.nn as nn
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
-MERGE_ROWS = 4  # 2x2 merge
+MERGE_PATCHES = 4  # 2x2 merge
 
 
 class _Upstream(nn.Module):
@@ -48,19 +48,19 @@ class _Block(nn.Module):
 
 
 class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
-    """Item ``i`` is ``tokens[i]`` rows per offset block, all holding ``i + 1``."""
+    """Item ``i`` is ``tokens[i]`` patches per offset group, all holding ``i + 1``."""
 
     def __init__(self, max_tokens: int = 300, num_blocks: int = 1) -> None:
         super().__init__()
-        self.rows_per_token = MERGE_ROWS
+        self.patches_per_token = MERGE_PATCHES
         self.max_tokens_per_item = max_tokens
         self.out_hidden_size = 8
-        self.vision_buffers = {"rows": VisionBuffer(8), "segments": VisionBuffer(None, pad=-1.0)}
+        self.vision_buffers = {"patches": VisionBuffer(8), "segments": VisionBuffer(None, pad=-1.0)}
         self.blocks = nn.ModuleList([_Block() for _ in range(num_blocks)])
-        self.forward_rows: list[int] = []
+        self.forward_patches: list[int] = []
         self.seen_taps: list[list[torch.Tensor]] = []
 
-    def vision_item_rows(self, mm_kwargs: dict[str, Any]) -> list[int]:
+    def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
         return list(mm_kwargs["tokens"])
 
     def select_encoder_cudagraph_items(self, mm_kwargs, indices):
@@ -69,19 +69,19 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
     def vision_inputs(self, mm_kwargs):
         ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
         seg = torch.cat([torch.full((t,), float(i + 1)) for i, t in zip(ids, mm_kwargs["tokens"])])
-        seg = seg.repeat(MERGE_ROWS).to(torch.float16)
-        return {"rows": seg[:, None].expand(-1, 8).contiguous(), "segments": seg}
+        seg = seg.repeat(MERGE_PATCHES).to(torch.float16)
+        return {"patches": seg[:, None].expand(-1, 8).contiguous(), "segments": seg}
 
     def vision_pre(self, values):
-        return values["rows"], {"offset": 0.0}
+        return values["patches"], {"offset": 0.0}
 
     def vision_blocks(self):
         return self.blocks
 
     def vision_post(self, x, taps):
-        self.forward_rows.append(x.shape[0])
+        self.forward_patches.append(x.shape[0])
         self.seen_taps.append(taps)
-        return x.reshape(MERGE_ROWS, -1, x.shape[-1]).mean(dim=0)
+        return x.reshape(MERGE_PATCHES, -1, x.shape[-1]).mean(dim=0)
 
 
 def _vllm_config(budgets=None, tp_mode="weights"):
@@ -110,7 +110,7 @@ def _manager(model, **kwargs) -> SpyreEncoderGraphManager:
 def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     manager = _manager(_FakeVisionModel(max_tokens=300))
     assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
-    assert all(b * MERGE_ROWS % 64 == 0 for b in manager.token_budgets)
+    assert all(b * MERGE_PATCHES % 64 == 0 for b in manager.token_budgets)
 
 
 def test_user_budgets_below_the_largest_item_fail_at_startup():
@@ -127,13 +127,13 @@ def test_execute_packs_pads_per_block_and_splits_per_item():
     model = _FakeVisionModel(max_tokens=300)
     manager = _manager(model)
     manager.capture(graph_pool=None)
-    assert sorted(model.forward_rows) == sorted(b * MERGE_ROWS for b in manager.token_budgets)
+    assert sorted(model.forward_patches) == sorted(b * MERGE_PATCHES for b in manager.token_budgets)
 
-    model.forward_rows.clear()
+    model.forward_patches.clear()
     outputs = manager.execute({"tokens": [10, 30]})
 
-    # 40 rows pack into the 64-row budget: one compiled call at 256 input rows.
-    assert model.forward_rows == [64 * MERGE_ROWS]
+    # 40 tokens pack into the 64-token budget: one compiled call at 256 patches.
+    assert model.forward_patches == [64 * MERGE_PATCHES]
     assert [o.shape[0] for o in outputs] == [10, 30]
     for i, out in enumerate(outputs):
         assert out.device.type == "cpu"
@@ -147,17 +147,17 @@ def test_unrecorded_budget_is_a_miss():
 
 def test_inputs_must_match_the_declared_buffers():
     """An upstream ``prepare_encoder_cudagraph_replay_buffers`` with other keys would
-    otherwise replay stale padding rows silently."""
+    otherwise replay stale padding silently."""
     model = _FakeVisionModel()
-    model.vision_inputs = lambda mm_kwargs: {"rows": torch.zeros(4, 8, dtype=torch.float16)}
+    model.vision_inputs = lambda mm_kwargs: {"patches": torch.zeros(4, 8, dtype=torch.float16)}
     with pytest.raises(ValueError, match="vision_buffers declares"):
         model.prepare_encoder_cudagraph_replay_buffers({"tokens": [1]}, 0, 0)
 
 
-def test_inputs_must_be_fp16_with_one_row_count():
+def test_inputs_must_be_fp16_with_one_patch_count():
     model = _FakeVisionModel()
     model.vision_inputs = lambda mm_kwargs: {
-        "rows": torch.zeros(4, 8),
+        "patches": torch.zeros(4, 8),
         "segments": torch.zeros(4, dtype=torch.float16),
     }
     with pytest.raises(ValueError, match="fp16"):
@@ -170,12 +170,12 @@ def test_items_per_call_cap_splits_the_batch():
     try:
         manager = _manager(model)
         manager.capture(graph_pool=None)
-        model.forward_rows.clear()
+        model.forward_patches.clear()
         outputs = manager.execute({"tokens": [10, 30]})
     finally:
         del type(model).vision_max_items_per_call
     assert manager.max_batch_size == 1
-    assert len(model.forward_rows) == 2
+    assert len(model.forward_patches) == 2
     assert [o.shape[0] for o in outputs] == [10, 30]
 
 
@@ -184,7 +184,7 @@ def test_taps_reach_vision_post_in_declared_order():
     type(model).vision_taps = (-1, 0, 2)
     try:
         bufs = model._vision_empty(64)
-        bufs["rows"][:] = 1.0
+        bufs["patches"][:] = 1.0
         model.blocks[0].forward = lambda x, offset: x + 1
         model.blocks[1].forward = lambda x, offset: x + 10
         model.blocks[2].forward = lambda x, offset: x + 100
@@ -200,13 +200,13 @@ def test_postprocess_override_gets_host_output_and_shapes_each_item():
     model = _FakeVisionModel()
     seen = []
 
-    def postprocess(outputs, indices, rows, dest, clone=False, batch_mm_kwargs=None):
+    def postprocess(outputs, indices, tokens, dest, clone=False, batch_mm_kwargs=None):
         out = outputs["default"]
         seen.append(out.device.type)
         offset = 0
         for i in indices:
-            dest[i] = out[offset + 1 : offset + rows[i]]
-            offset += rows[i]
+            dest[i] = out[offset + 1 : offset + tokens[i]]
+            offset += tokens[i]
 
     model.postprocess_encoder_output = postprocess
     embeds = model.embed_multimodal(tokens=[10, 30])
@@ -215,7 +215,7 @@ def test_postprocess_override_gets_host_output_and_shapes_each_item():
 
 
 def test_budget_range_override_sets_the_largest_budget():
-    """A model whose processor count is not in encoder rows overrides upstream's hook."""
+    """A model whose processor count is not in encoder tokens overrides upstream's hook."""
     model = _FakeVisionModel(max_tokens=300)
     model.get_encoder_cudagraph_budget_range = lambda vllm_config: (16, 500)
     manager = _manager(model)

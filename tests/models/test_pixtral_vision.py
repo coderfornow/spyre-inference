@@ -14,7 +14,7 @@
 
 """``SpyrePixtralForConditionalGeneration``'s vision pipeline against upstream Pixtral.
 
-The pipeline reorders rows, folds the conv into a linear, permutes the merger weight
+The pipeline reorders patches, folds the conv into a linear, permutes the merger weight
 and pads to a bucket; these tests pin each of those to the upstream result on CPU. The
 on-card twin at the bottom skips without a device.
 """
@@ -29,7 +29,7 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 
 pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
 
-PATCH = 7  # 3*7*7 = 147 values per row: exercises the row-width padding to 192
+PATCH = 7  # 3*7*7 = 147 values per patch: exercises the patch-width padding to 192
 MERGE = 2
 
 
@@ -126,7 +126,7 @@ def _spyre_model(args, dtype=torch.float16):
 
 def _images() -> list[torch.Tensor]:
     torch.manual_seed(1)
-    # Non-square, 96 + 24 = 120 patch rows: off the 64 stick, so padding rows are live.
+    # Non-square, 96 + 24 = 120 patches: off the 64 stick, so padding slots are live.
     return [torch.randn(3, 8 * PATCH, 12 * PATCH), torch.randn(3, 6 * PATCH, 4 * PATCH)]
 
 
@@ -151,8 +151,8 @@ def test_pipeline_matches_upstream(tp_group, num_images):
         assert _cosine(got, want) > 0.999
 
 
-def test_padding_rows_do_not_leak_into_images(tp_group):
-    """Bucket padding must not change any image's embedding: padding rows have their own
+def test_padding_does_not_leak_into_images(tp_group):
+    """Bucket padding must not change any image's embedding: padding slots have their own
     segment, and each offset block is padded separately."""
     args = _args(num_layers=1)
     model = _spyre_model(args)
@@ -160,8 +160,8 @@ def test_padding_rows_do_not_leak_into_images(tp_group):
     values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
     config = model.get_encoder_cudagraph_config()
 
-    def run(num_rows):
-        bufs = model._vision_empty(num_rows)
+    def run(num_patches):
+        bufs = model._vision_empty(num_patches)
         for key, src in values.items():
             config.padding_logics.get(key, lambda d, s: d[: s.shape[0]].copy_(s))(bufs[key], src)
         return model.encoder_cudagraph_forward(bufs)
@@ -173,7 +173,7 @@ def test_padding_rows_do_not_leak_into_images(tp_group):
 
 
 def test_offset_major_merge_matches_upstream_merger(tp_group):
-    """Offset-major rows times the per-offset weight equal ``unfold`` plus the original."""
+    """Offset-major patches times the per-offset weight equal ``unfold`` plus the original."""
     from spyre_inference.models._vision_encoder import offset_major
     from spyre_inference.models.pixtral import offset_major_merge_weight
 
