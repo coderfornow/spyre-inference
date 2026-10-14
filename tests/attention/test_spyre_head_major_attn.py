@@ -485,9 +485,9 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
 
 
 _SHAPES = [
-    pytest.param([(1, 128)], id="decode_single"),
+    pytest.param([(1, 128)], id="decode_single", marks=pytest.mark.attention_smoke),
     pytest.param([(1, 300), (1, 64), (1, 512)], id="decode_batch"),
-    pytest.param([(64, 64)], id="prefill_single"),
+    pytest.param([(64, 64)], id="prefill_single", marks=pytest.mark.attention_smoke),
     pytest.param([(128, 128), (64, 200)], id="prefill_batch"),
     pytest.param([(64, 300), (1, 128)], id="mixed_batch"),
 ]

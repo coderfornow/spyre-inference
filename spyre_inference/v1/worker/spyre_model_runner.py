@@ -51,6 +51,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
@@ -83,9 +84,11 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
+from spyre_inference.models import check_spyre_model
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
+from spyre_inference.multimodal.utils import blocks_marked_compilable
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -113,17 +116,18 @@ from spyre_inference.v1.pool.spyre_pooler import (
     _mean_pool_grid_reduce,
     _mean_pool_row_mask_mul,
 )
+from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
+    encoder_grid_source_rows,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
     encoder_rectangles,
     encoder_shape_tables,
-    expand_packed_embeds_to_encoder_grid,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
     logits_row_buckets,
@@ -321,17 +325,23 @@ def _is_vision_tower_path(qualname: str) -> bool:
     return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
 
 
-def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
-    block_lists = []
+def _repeated_block_lists(model: nn.Module) -> list[tuple[nn.ModuleList, bool]]:
+    """Each compilable block list with whether a multimodal patch marked it."""
+    block_lists: list[tuple[nn.ModuleList, bool]] = []
     for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
             continue
-        # Encoder-only towers stay eager even if a block's class name looks like
-        # attention (Qwen2_5_VLVisionAttention). Decoder lists are never named these.
-        if _is_vision_tower_path(qualname):
-            continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
+            continue
+        # A multimodal patch marks the blocks whose body it made traceable; reading the
+        # mark off the blocks keeps an outer list that merely nests a marked tower out.
+        if blocks_marked_compilable(blocks):
+            block_lists.append((module, True))
+            continue
+        # Every other tower stays eager: its block body builds constants on the host,
+        # which have no device layout. Decoder lists are never named these.
+        if _is_vision_tower_path(qualname):
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
@@ -340,7 +350,7 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
         if any(_is_decoder_attention_like(m) for b in blocks for m in b.modules()):
-            block_lists.append(module)
+            block_lists.append((module, False))
     return block_lists
 
 
@@ -462,12 +472,12 @@ class _SpyreModelWrapper:
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        # Vision towers run eager, so each Spyre op with a decomposition reaches it
-        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
-        # without fullgraph. Decompositions built on for_each_tile (SDPA since
-        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
-        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
-        # trace dies with DataDependentOutputException.
+        # The parts of a vision tower outside a compiled block run eager, so each Spyre
+        # op with a decomposition there reaches it through torch-spyre's lazily-compiled
+        # PrivateUse1 kernel, which compiles without fullgraph. Decompositions built on
+        # for_each_tile (SDPA since torch-spyre#4550) emit a scan whose while_loop
+        # lowering reads the loop index with .item(); without fullgraph that needs
+        # capture_scalar_outputs, or the trace dies with DataDependentOutputException.
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
             return self._model.embed_multimodal(**kwargs)
 
@@ -606,17 +616,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # via self._spyre_device regardless of self.device.
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, torch.device("cpu"))
+        # Patch upstream's Sampler in place, so every holder of it (e.g. the
+        # RejectionSampler) takes the host-side draws.
+        self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
+            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
+        )
+        self.sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre
         # int64 at the model boundary.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
-
-        # Sort-free top-k path (see SpyreTopKTopPSampler).
-        self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
-            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
-        )
 
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False
@@ -663,6 +674,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        check_spyre_model(self.model, get_model_architecture(self.model_config)[1])
         self.model_memory_usage = 0  # No GPU memory profiling for Spyre
 
         # Cases appearing in GPUModelRunner.
@@ -807,6 +819,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Per-block is the default: identical blocks share a ``forward`` code object,
         # so the backend compiles one block rather than a program that grows with depth.
         granularity = _compile_granularity()
+        self._compiled_tower_blocks = 0
 
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
@@ -828,11 +841,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     defeated_by,
                 )
             num_blocks = self._compile_blocks(fullgraph=fullgraph)
+            tower = self._compiled_tower_blocks
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
+                    "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre "
                     "(fullgraph=%s).",
                     num_blocks,
+                    f" and {tower} tower blocks" if tower else "",
                     model_name,
                     fullgraph,
                 )
@@ -854,11 +869,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
     def _compile_blocks(self, fullgraph: bool = True) -> int:
-        num_blocks = 0
+        # Only decoder blocks are returned: the count decides the whole-model fallback,
+        # which an opted-in tower must not pre-empt (it compiles beside either form).
+        num_blocks = num_tower = 0
         # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
         # alias blocks across lists; recompiling one is harmless but would double the count.
         seen: set[int] = set()
-        for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
+        for blocks, marked in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
                 if isinstance(block, PPMissingLayer) or id(block) in seen:
                     continue
@@ -870,9 +887,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 # Identical blocks share one `forward` code object -- that is why this
                 # granularity shares a single artifact -- so this collapses to one
                 # registration per block *class*, which is the right granularity for
-                # the message too.
+                # the message too. A marked tower is watched like the decoder:
+                # `_warmup_multimodal_encoder` compiles it at every image-batch width.
                 compile_guard.watch(block, f"{type(block).__name__} (transformer block)")
-                num_blocks += 1
+                if marked:
+                    num_tower += 1
+                else:
+                    num_blocks += 1
+        self._compiled_tower_blocks = num_tower
         return num_blocks
 
     def warming_up_model(self) -> None:
@@ -889,7 +911,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         while the rectangular path is opaque. With the rectangular path traced into the
         block graph, ``_warm_encoder_inline_paths`` gives each rectangle its own dummy and
         forces one onto the ragged path, which is what reaches the impl.
-        Eager pooling: one short dummy, then ``mark_warmed_up()``.
+        Eager pooling: one short dummy, then ``mark_warmed_up()``. It does not run the
+        vision tower, whose eager ops compile per op on first use anyway.
+        A compiled pooling model's vision tower, and any model's compiled one, also runs
+        ``embed_multimodal`` at every image-batch width up to ``mm_max_items_per_batch``;
+        see ``_warmup_multimodal_encoder``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -914,6 +940,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._warm_pooler_row_widths(hidden_states)
                         self._warm_encoder_unpack(hidden_states)
                     self._warm_encoder_inline_paths()
+                    self._warm_encoder_embed_gather()
                     self.spyre_shape_bucketer.mark_warmed_up()
                 if self._spyre_kv_caches:
                     # A decoder-type text tower (e.g. CLIP's) has a real KV cache;
@@ -921,6 +948,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # the dummy-batch seq_lens bug. No-op for encoder-only pooling
                     # models (BERT/RoBERTa), which never get a KV cache.
                     self._record_attention_graphs()
+                self._warmup_multimodal_encoder()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -934,6 +962,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
                 self._warmup_input_embedding(num_tokens)
+                # Only a compiled tower is warmed here: enforce_eager reaches this
+                # branch, and an eager tower compiles per op on first use regardless.
+                if self._compiled_tower_blocks:
+                    self._warmup_multimodal_encoder()
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -963,6 +995,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+            self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -991,6 +1024,48 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
         model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
         logger.info_once("Warming the input embedding through embed_input_ids.")
+
+    @torch.inference_mode()
+    def _warmup_multimodal_encoder(self) -> None:
+        """Compile the vision tower at every image-batch width it can see.
+
+        Nothing else traces the tower before the compile guard arms: the dummy runs
+        reach the text body only, and upstream's ``profile_run`` (one pass at
+        ``mm_max_items_per_batch``) never runs, as ``TorchSpyreWorker`` overrides
+        ``determine_available_memory``. Under ``dynamic=False`` every width is its own
+        graph, for marked encoder blocks and ``SpyreConv2d`` alike, so each runs here
+        (spyre-inference#1182).
+
+        A generative VLM is enumerated only when its tower's blocks are compiled. An
+        eager tower's ops compile through torch-spyre's per-op kernels, which the guard
+        expects on the serving path, and enumerating them would dominate startup.
+        """
+        if not self.supports_mm_inputs or (
+            self.model_config.runner_type != "pooling" and not self._compiled_tower_blocks
+        ):
+            return
+        mm_budget = getattr(self, "mm_budget", None)
+        max_items = getattr(mm_budget, "mm_max_items_per_batch", None)
+        model = cast(_SpyreModelWrapper, self.model)
+        if not max_items or not hasattr(model, "embed_multimodal"):
+            return
+
+        widths = [(modality, int(n)) for modality, n in max_items.items() if int(n) >= 1]
+        # Images only for a generative tower: an image item is one tower row of a fixed shape;
+        # a video or audio item expands to a frame or chunk count the request sets.
+        if self.model_config.runner_type != "pooling":
+            widths = [(modality, n) for modality, n in widths if modality == "image"]
+        if not widths:
+            return
+        logger.info(
+            "Warming multimodal encoder batch widths: %s.",
+            ", ".join(f"{modality} 1..{n}" for modality, n in widths),
+        )
+        t0 = time.time()
+        for modality, n_max in widths:
+            for n in range(1, n_max + 1):
+                model.embed_multimodal(**self._get_mm_dummy_batch(modality, n))
+        logger.info("Multimodal encoder warmup done in %.3fs.", time.time() - t0)
 
     @torch.inference_mode()
     def _record_attention_graphs(self) -> None:
@@ -1119,6 +1194,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
             build_encoder_plan,
+            encoder_inline_active,
             publish_encoder_grid,
         )
 
@@ -1135,6 +1211,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
         plan = None
         seen: set[int] = set()
+        causal: set[bool] = set()
         for group in groups:
             if not isinstance(group, dict):
                 continue
@@ -1142,9 +1219,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if id(md) in seen or not hasattr(md, "encoder_plan"):
                     continue
                 seen.add(id(md))
+                encoder_md = cast(SpyreAttentionMetadata, md)
+                causal.add(encoder_md.apply_causal_mask)
                 if md.encoder_plan is None:
-                    encoder_md = cast(SpyreAttentionMetadata, md)
-                    plan = self._forced_encoder_plan() or build_encoder_plan(
+                    plan = self._forced_encoder_plan(encoder_md) or build_encoder_plan(
                         encoder_md,
                         rectangles=rectangles,
                         width_cap_for=self._encoder_width_caps,
@@ -1160,6 +1238,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else:
                     plan = md.encoder_plan
 
+        # The traced rectangle reads one published mask in every inlined layer, so groups
+        # that differ in causality cannot share it.
+        if isinstance(plan, EncoderRectPlan) and encoder_inline_active() and len(causal) > 1:
+            raise NotImplementedError(
+                "Encoder attention groups mix causal and bidirectional masks; the traced "
+                "rectangle path publishes one mask for all of them."
+            )
         # A rectangle's mask shape is how a traced forward reads the grid; the ragged path
         # publishes nothing and so stays opaque.
         publish_encoder_grid(plan)
@@ -1179,13 +1264,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
         return out
 
-    def _forced_encoder_plan(self):
+    def _forced_encoder_plan(self, md: SpyreAttentionMetadata):
         """Warmup's declared rectangle, ignoring the dummy batch's own shape.
 
         Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
         ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
         ``sum(query_lens)`` the body row count, which keeps ``_preprocess``'s expansion an
-        identity.
+        identity. The mask takes ``md``'s causality, as the group's real plans do.
         """
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
@@ -1199,7 +1284,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             extent=extent,
             width=width,
             mask=convert(
-                encoder_key_pad_mask(extent, [extent] * width, self._model_dtype()),
+                encoder_key_pad_mask(
+                    extent, [extent] * width, self._model_dtype(), md.apply_causal_mask
+                ),
                 self._spyre_device,
             ),
             query_lens=[extent] * width,
@@ -1486,6 +1573,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
         select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
 
+    @torch.inference_mode()
+    def _warm_encoder_embed_gather(self) -> None:
+        """Compile ``_preprocess``'s embeddings-to-grid gather once per rectangle.
+
+        Only a multimodal pooling model (e.g. CLIP) reaches it, and ``_dummy_run`` hands
+        the model its own ``inputs_embeds`` without going through ``_preprocess``.
+        """
+        buffer = getattr(self, "inputs_embeds", None)
+        if (
+            not self.supports_mm_inputs
+            or not self._pooling_on_spyre
+            or not self._encoder_rectangles
+            or buffer is None
+        ):
+            return
+        body = buffer.gpu[: self._encoder_budget]
+        for extent, width in self._encoder_rectangles:
+            select_rows(body, torch.zeros(width * extent, dtype=torch.int64))
+
     def _unpad_encoder_hidden(
         self, hidden_states: torch.Tensor, num_scheduled_tokens: int
     ) -> torch.Tensor:
@@ -1525,8 +1631,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         pad count, so the interior per-sequence padding a rectangle needs has to
         happen here. The `input_ids` path packs only integer tensors (tens of KB),
         avoiding a per-layer activation gather. Multimodal pooling with only
-        `inputs_embeds` instead copies the floating-point embeddings to CPU,
-        expands them there and converts the grid back to the original device.
+        `inputs_embeds` instead gathers the embeddings into the grid on the device,
+        with an index built on the host, so they never round-trip through the host.
 
         On the packed path, absolute-position RoBERTa still offsets positions here
         before the embedding gather. ``query_start_loc`` and ``seq_lens`` keep the
@@ -1534,11 +1640,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
+        # A model that masks multimodal rows after embedding (CLIP, models/clip.py)
+        # needs its mask in the same row layout as the embeddings.
+        align_token_mask = getattr(self.model, "spyre_align_token_mask", None)
         if grid is None:
+            if align_token_mask is not None:
+                scheduler_output = args[0] if args else kwargs["scheduler_output"]
+                align_token_mask(scheduler_output.total_num_scheduled_tokens, None)
             return self._offset_preprocess_positions(out)
         input_ids, inputs_embeds, positions, *rest = out
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
+        if align_token_mask is not None:
+            align_token_mask(num_tokens, grid)
         hf_config = getattr(self.model_config, "hf_config", None)
         position_offset = roberta_position_delta(hf_config)
 
@@ -1569,11 +1683,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 position_offset=position_offset,
             )
             grid_ids = None
-            grid_embeds = convert(
-                expand_packed_embeds_to_encoder_grid(
-                    inputs_embeds[:num_tokens].cpu(), query_lens, width, extent
+            # Gathered from the whole body buffer, not a `[:num_tokens]` slice: the
+            # gather specialises on its source's row count, which then stays fixed.
+            grid_embeds = select_rows(
+                inputs_embeds,
+                torch.tensor(
+                    encoder_grid_source_rows(query_lens, width, extent), dtype=torch.int64
                 ),
-                inputs_embeds.device,
             )
             assert grid_embeds.shape[0] == width * extent, (grid_embeds.shape[0], width * extent)
 
@@ -1694,7 +1810,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             prompt_token_ids=dummy_token_ids,
             prompt_token_ids_cpu=dummy_token_ids.cpu(),
             pooling_params=[dummy_pooling_params] * num_reqs,
-            pooling_states=[PoolingStates() for i in range(num_reqs)],
+            pooling_states=[PoolingStates() for _ in range(num_reqs)],
         )
         dummy_metadata.build_pooling_cursor(
             num_scheduled_tokens_np,

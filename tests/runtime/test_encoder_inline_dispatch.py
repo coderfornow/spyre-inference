@@ -289,7 +289,7 @@ class TestTracedForward:
         traced = layer.forward(query, key, value)
 
         output = torch.zeros((rows, heads * dim), dtype=torch.float16).view(-1, heads, dim)
-        metadata = SimpleNamespace(encoder_plan=plan)
+        metadata = SimpleNamespace(encoder_plan=plan, apply_causal_mask=False)
         opaque = layer.impl.forward(
             layer,
             query.view(-1, heads, dim),
@@ -319,7 +319,9 @@ class TestForcedWarmupPlan:
             _model_dtype=lambda: torch.float16,
             _spyre_device=torch.device("cpu"),
         )
-        return TorchSpyreModelRunner._forced_encoder_plan(runner)
+        return TorchSpyreModelRunner._forced_encoder_plan(
+            runner, SimpleNamespace(apply_causal_mask=False)
+        )
 
     def test_no_rect_forced_means_no_plan(self):
         assert self._plan(None) is None

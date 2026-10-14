@@ -198,6 +198,9 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
         pytest.skip(f"{GEMMA4_MODEL}@{GEMMA4_REVISION[:7]} not in the local HF cache")
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    # A tower compile at request time is a missed warmup shape: fail, don't log.
+    if not enforce_eager:
+        monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
 
     uri = _synthetic_image_data_uri()
     (text,) = _generate(
