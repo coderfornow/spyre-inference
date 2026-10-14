@@ -290,3 +290,60 @@ def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
         )
     actual = convert(out, device="cpu")[: expected.shape[0]]
     assert _cosine(actual, expected) > 0.995
+
+
+def _padded_device_inputs(model, images, token_budget):
+    from spyre_inference.custom_ops.utils import convert
+
+    values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
+    padding = model.get_encoder_cudagraph_config().padding_logics
+    bufs = model.prepare_encoder_cudagraph_capture_inputs(
+        token_budget, 1, 1, torch.device("cpu"), torch.float16
+    ).values
+    for key, src in values.items():
+        padding[key](bufs[key], src)
+    return {k: convert(v, device="spyre") for k, v in bufs.items()}
+
+
+@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
+def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group):
+    """The same padded device buffers through the uncompiled and the compiled pipeline."""
+    args = _args()
+    images = _images()
+    model = _spyre_model(args).to("spyre")
+    inputs = _padded_device_inputs(model, images, token_budget=64)
+    tokens = sum(model.vision_item_tokens({"images": images}))
+
+    with torch.inference_mode():
+        eager = model.encoder_cudagraph_forward(inputs)[:tokens]
+        model.compile_vision_graphs()
+        compiled = model.encoder_cudagraph_forward(inputs)[:tokens]
+
+    assert _cosine(compiled, eager) > 0.9999
+    torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
+def test_gather_table_gathers_exact_rows_on_spyre():
+    """Rows gathered on the card, eager and inside a compiled graph, are exactly the table's
+    rows. Compared with the table as the card holds it: uploading fp16 rounds to the card's
+    16-bit format, so the host values are not the reference."""
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.models._vision_encoder import GatherTable
+
+    torch.manual_seed(0)
+    host = torch.randn(256, 128).half()
+    # Off the stick and out of order, with repeats, like Pixtral's positions.
+    index = torch.randint(0, 256, (120,))
+    table = GatherTable(host.clone()).to("spyre")
+    device_index = convert(index, device="spyre")
+
+    with torch.inference_mode():
+        rows = convert(table.table, device="cpu")[index]
+        eager = convert(table.gather(device_index), device="cpu")
+        compiled_gather = torch.compile(table.gather, backend="inductor", dynamic=False)
+        compiled = convert(compiled_gather(device_index), device="cpu")
+
+    assert torch.equal(eager, rows)
+    assert torch.equal(compiled, rows)
+    torch.testing.assert_close(rows, host[index], atol=4e-3, rtol=1e-3)

@@ -209,7 +209,9 @@ class SpyreVisionEncoderMixin:
 
     def compile_vision_graphs(self) -> None:
         """Compile ``vision_embed``, every layer and ``vision_project`` with static shapes and
-        register them with the compile guard. Called once at warmup."""
+        register them with the compile guard. Called at warmup; a repeat call is a no-op."""
+        if hasattr(self, "_spyre_vision_embed"):
+            return
         compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
         self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
@@ -288,6 +290,10 @@ class SpyreVisionEncoderMixin:
         project = getattr(self, "_spyre_vision_project", self.vision_project)
         blocks = self.vision_blocks()
         depth = len(blocks) + 1
+        if any(not -depth <= t < depth for t in self.vision_taps):
+            raise ValueError(
+                f"vision_taps {self.vision_taps} is out of range for {depth} hidden states"
+            )
         wanted = {t % depth for t in self.vision_taps}
 
         x, block_kwargs = embed(inputs)

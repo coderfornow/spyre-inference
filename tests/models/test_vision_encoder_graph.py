@@ -273,3 +273,129 @@ def test_gather_table_gathers_rows_on_the_host():
         table.gather(torch.tensor([2, 0])), torch.tensor([[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]])
     )
     assert table.half().table.dtype == torch.float16
+
+
+def test_out_of_range_tap_fails_instead_of_aliasing():
+    """A tap past the last layer would otherwise wrap onto an earlier one by modulo."""
+    model = _FakeVisionModel(num_blocks=2)
+    type(model).vision_taps = (3,)
+    try:
+        with pytest.raises(ValueError, match="out of range for 3 hidden states"):
+            model.encoder_cudagraph_forward(model._vision_empty(64))
+    finally:
+        del type(model).vision_taps
+
+
+def test_compile_vision_graphs_twice_keeps_the_first_compile():
+    """A retried warmup must not re-wrap the graphs it already compiled."""
+    model = _FakeVisionModel(num_blocks=2)
+    model.compile_vision_graphs()
+    embed, project = model._spyre_vision_embed, model._spyre_vision_project
+    blocks = [b._compiled_call_impl for b in model.blocks]
+    model.compile_vision_graphs()
+    assert model._spyre_vision_embed is embed
+    assert model._spyre_vision_project is project
+    assert [b._compiled_call_impl for b in model.blocks] == blocks
+
+
+def test_item_and_frame_caps_together_through_capture_and_execute():
+    """Both caps reach capture, and replay still splits the batch at the item cap."""
+    model = _FakeVisionModel()
+    config = model.get_encoder_cudagraph_config()
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, max_frames_per_video=8)
+    capture_limits = []
+    prepare = model.prepare_encoder_cudagraph_capture_inputs
+
+    def recording_prepare(budget, max_batch_size, max_frames_per_batch, *args, **kwargs):
+        capture_limits.append((max_batch_size, max_frames_per_batch))
+        return prepare(budget, max_batch_size, max_frames_per_batch, *args, **kwargs)
+
+    model.prepare_encoder_cudagraph_capture_inputs = recording_prepare
+    type(model).vision_max_items_per_call = 2
+    try:
+        manager = _manager(model, videos=1)
+        manager.capture(graph_pool=None)
+        model.forward_patches.clear()
+        outputs = manager.execute({"tokens": [5, 10, 15, 20, 25]})
+    finally:
+        del type(model).vision_max_items_per_call
+    assert set(capture_limits) == {(2, 16)}
+    assert len(model.forward_patches) == 3
+    assert [o.shape[0] for o in outputs] == [5, 10, 15, 20, 25]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def test_each_path_compiles_and_replays_from_its_own_staging():
+    """A model declaring two upstream paths gets one staging set per path and budget."""
+    from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphPathConfig, EncoderItemSpec
+
+    model = _FakeVisionModel()
+    config = model.get_encoder_cudagraph_config()
+    paths = {"local": EncoderCudaGraphPathConfig(), "global": EncoderCudaGraphPathConfig()}
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, paths=paths)
+    model.get_encoder_cudagraph_item_specs = lambda mm_kwargs: [
+        EncoderItemSpec(t * MERGE_PATCHES, t, {"local": t, "global": t})
+        for t in mm_kwargs["tokens"]
+    ]
+    forward = model.encoder_cudagraph_forward
+    seen_paths = []
+
+    def recording_forward(inputs, path="default"):
+        seen_paths.append(path)
+        return forward(inputs) + (100.0 if path == "global" else 0.0)
+
+    model.encoder_cudagraph_forward = recording_forward
+    model.postprocess_encoder_output = lambda outputs, indices, tokens, dest, **kw: [
+        dest.__setitem__(i, outputs["local"][:t] + outputs["global"][:t])
+        for i, t in zip(indices, [tokens[i] for i in indices])
+    ]
+
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    assert set(manager._staging) == {"local", "global"}
+    assert all(set(s) == set(manager.token_budgets) for s in manager._staging.values())
+
+    seen_paths.clear()
+    (out,) = manager.execute({"tokens": [10]})
+    assert sorted(seen_paths) == ["global", "local"]
+    torch.testing.assert_close(out, torch.full_like(out, 1.0 + 101.0))
+
+
+def test_runner_warmup_builds_the_manager_and_serves_through_it():
+    """The runner path: _record_vision_graphs compiles the model, builds the Spyre manager
+    from the processor's largest item and captures every budget."""
+    from vllm.config import CompilationMode
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    model = _FakeVisionModel()
+    compiled = []
+    model.compile_vision_graphs = lambda: compiled.append(True)
+    vllm_config = _vllm_config()
+    vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    vllm_config.compilation_config.inductor_compile_config = {}
+    vllm_config.model_config.enforce_eager = False
+    vllm_config.model_config.dtype = torch.float16
+
+    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+    runner.vllm_config = vllm_config
+    runner.compilation_config = vllm_config.compilation_config
+    runner.model_config = vllm_config.model_config
+    runner.supports_mm_inputs = True
+    runner.model = SimpleNamespace(_model=model)
+    runner.mm_budget = SimpleNamespace(mm_max_toks_per_item={"image": 300})
+    runner._spyre_device = torch.device("cpu")
+    runner.encoder_cudagraph_manager = None
+
+    runner._record_vision_graphs()
+
+    manager = runner.encoder_cudagraph_manager
+    assert compiled == [True]
+    assert isinstance(manager, SpyreEncoderGraphManager)
+    assert model.max_tokens_per_item == 300
+    assert manager.token_budgets[-1] == 304
+    assert set(manager._staging["default"]) == set(manager.token_budgets)
+    outputs = manager.execute({"tokens": [10, 30]})
+    assert [o.shape[0] for o in outputs] == [10, 30]
+    assert manager.graph_hits == 2 and manager.graph_misses == 0
