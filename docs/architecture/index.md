@@ -285,15 +285,16 @@ count these rows, and host inputs have `rows_per_token` rows per output row.
 | `vision_post(x, taps)` | yes | graph 3: `-> [rows, out_hidden_size]` | projector norm, patch merge, adapter |
 | `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
 | `vision_taps` | no | intermediate hidden states passed to `vision_post` | none |
-| `vision_finalize` | no | host step from encoder rows to placeholder embeddings (unpad, newline rows) | default split |
 | `vision_row_blocks`, `vision_row_quantum` | no | padding layout and alignment (default: offset blocks, 64-row sticks) | default |
-| `vision_max_tokens_per_item(mm_budget)` | no | largest item in encoder rows (default: the processor's count) | default |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
 
-The mixin owns the protocol methods tied to this layout (`prepare_encoder_cudagraph_replay_buffers`,
-item specs, capture inputs, forward, postprocess), so an upstream class's own versions of those
-are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
+Two upstream protocol methods are also the extension points for model-specific shapes, used
+as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
+differ from encoder rows (unpadding, newline rows; its input is already on the host), and
+`get_encoder_cudagraph_budget_range` when the processor's largest item is not counted in encoder
+rows. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
+capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
 upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. The eager
 (`enforce_eager`) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
@@ -303,7 +304,7 @@ Constraints the layout follows:
 
 - The largest budget is the largest item the model's upstream processor can produce
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
-  uses, converted to encoder rows by `vision_max_tokens_per_item`), so no item needs a shape
+  uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
   warmup skipped. Each budget is a whole number of `vision_row_quantum` rows.
 - Rows are **offset-major**: one block per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul

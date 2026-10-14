@@ -195,13 +195,31 @@ def test_taps_reach_vision_post_in_declared_order():
     assert [float(t[0, 0]) for t in taps] == [112.0, 1.0, 12.0]
 
 
-def test_finalize_hook_shapes_each_item():
+def test_postprocess_override_gets_host_output_and_shapes_each_item():
+    """A model reshapes its embeddings through upstream's ``postprocess_encoder_output``."""
     model = _FakeVisionModel()
-    model.vision_finalize = lambda out, rows, mm_kwargs: [
-        t[1:] for t in torch.split(out[: sum(rows)], rows)
-    ]
+    seen = []
+
+    def postprocess(outputs, indices, rows, dest, clone=False, batch_mm_kwargs=None):
+        out = outputs["default"]
+        seen.append(out.device.type)
+        offset = 0
+        for i in indices:
+            dest[i] = out[offset + 1 : offset + rows[i]]
+            offset += rows[i]
+
+    model.postprocess_encoder_output = postprocess
     embeds = model.embed_multimodal(tokens=[10, 30])
+    assert seen == ["cpu"]
     assert [e.shape[0] for e in embeds] == [9, 29]
+
+
+def test_budget_range_override_sets_the_largest_budget():
+    """A model whose processor count is not in encoder rows overrides upstream's hook."""
+    model = _FakeVisionModel(max_tokens=300)
+    model.get_encoder_cudagraph_budget_range = lambda vllm_config: (16, 500)
+    manager = _manager(model)
+    assert manager.token_budgets[-1] >= 500
 
 
 def test_other_modalities_go_to_upstream():

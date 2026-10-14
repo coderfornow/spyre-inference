@@ -57,10 +57,11 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
         self.token_budgets = aligned(self.token_budgets)
         self.path_token_budgets = {p: aligned(b) for p, b in self.path_token_budgets.items()}
-        if self.token_budgets[-1] < model.max_tokens_per_item:
+        largest_item = model.get_encoder_cudagraph_budget_range(vllm_config)[1]
+        if self.token_budgets[-1] < largest_item:
             raise ValueError(
                 f"largest encoder budget {self.token_budgets[-1]} is below the largest "
-                f"image ({model.max_tokens_per_item} tokens), which would then compile "
+                f"item ({largest_item} rows), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
         if model.vision_max_items_per_call is not None:

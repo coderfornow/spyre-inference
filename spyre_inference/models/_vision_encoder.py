@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 import torch.nn as nn
+from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
     EncoderCudaGraphConfig,
@@ -42,7 +43,6 @@ from spyre_inference.v1.worker import compile_guard
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.multimodal.encoder_budget import MultiModalBudget
 
 
 @dataclass
@@ -101,9 +101,9 @@ class SpyreVisionEncoderMixin:
         """Encoder output rows each item will produce, in item order.
 
         Implement from the item shapes in ``mm_kwargs`` (host-only, no tensor reads on the
-        card). These are rows of ``vision_post``'s output before ``vision_finalize``, the unit
-        of upstream's token budgets, so ``sum(rows) * rows_per_token`` input rows must equal the
-        row count ``vision_inputs`` returns for the same items.
+        card). These are rows of ``vision_post``'s output, the unit of upstream's token budgets,
+        so ``sum(rows) * rows_per_token`` input rows must equal the row count ``vision_inputs``
+        returns for the same items.
         """
         raise NotImplementedError
 
@@ -153,7 +153,8 @@ class SpyreVisionEncoderMixin:
     vision_taps: ClassVar[tuple[int, ...]] = ()
     # Most items one encoder call can carry, when the layout bounds it (e.g. a one-hot width).
     vision_max_items_per_call: ClassVar[int | None] = None
-    # Set by the runner from vision_max_tokens_per_item before the manager is built.
+    # Encoder rows of the largest item, set by the runner from upstream's processor budget
+    # before the manager is built; read by get_encoder_cudagraph_budget_range.
     max_tokens_per_item: int
 
     # --- optional hooks ---
@@ -186,27 +187,6 @@ class SpyreVisionEncoderMixin:
         returns a tuple (e.g. SigLIP returns ``(hidden, None)``).
         """
         return block(x, **block_kwargs)
-
-    def vision_finalize(
-        self, out: torch.Tensor, item_rows: list[int], mm_kwargs: dict[str, Any]
-    ) -> list[torch.Tensor]:
-        """Host step from the encoder output to one embedding per item.
-
-        ``out`` is ``vision_post``'s output on the host, items in order with padding rows at
-        the tail; ``item_rows`` comes from ``vision_item_rows``. Default: split by
-        ``item_rows``. Override when placeholders differ from encoder rows (e.g. unpadding or
-        newline rows), returning tensors that match each item's placeholder count.
-        """
-        return list(torch.split(out[: sum(item_rows)], item_rows))
-
-    def vision_max_tokens_per_item(self, mm_budget: MultiModalBudget) -> int:
-        """Encoder output rows of the largest item the processor can produce.
-
-        Sizes the largest warmup budget. Default: upstream's processor count
-        (``mm_max_toks_per_item``), right when every placeholder is one encoder row. Override
-        when they differ, from the processor's limits (e.g. the most tiles times rows per tile).
-        """
-        return max(mm_budget.mm_max_toks_per_item[m] for m in self.vision_modalities)
 
     # --- generic machinery: models do not override these ---
 
@@ -260,7 +240,11 @@ class SpyreVisionEncoderMixin:
         )
 
     def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
-        """Smallest and largest token budget: one row quantum, and the largest item."""
+        """Smallest and largest token budget: one row quantum, and the largest item.
+
+        Override when the processor's count is not in encoder rows (e.g. unpadding or newline
+        rows), returning the largest item's encoder rows as the maximum.
+        """
         return self.vision_row_quantum // self.rows_per_token, self.max_tokens_per_item
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
@@ -301,7 +285,11 @@ class SpyreVisionEncoderMixin:
         self, inputs: dict[str, torch.Tensor], path: str = "default"
     ) -> torch.Tensor:
         """Run the encoder on padded device buffers: ``vision_pre``, every block, collecting
-        ``vision_taps``, then ``vision_post``. Compiled after ``compile_vision_graphs``."""
+        ``vision_taps``, then ``vision_post``, compiled after ``compile_vision_graphs``.
+
+        Returns the output on the host in one copy: device views at row offsets off the stick
+        read as offset 0 (torch-spyre#3770), and the embedding merge runs on the host anyway.
+        """
         pre = getattr(self, "_spyre_vision_pre", self.vision_pre)
         post = getattr(self, "_spyre_vision_post", self.vision_post)
         blocks = self.vision_blocks()
@@ -313,7 +301,7 @@ class SpyreVisionEncoderMixin:
             x = self.vision_call_block(block, x, block_kwargs)
             if i in wanted:
                 hidden[i] = x
-        return post(x, [hidden[t % depth] for t in self.vision_taps])
+        return convert(post(x, [hidden[t % depth] for t in self.vision_taps]), device="cpu")
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"
@@ -341,17 +329,12 @@ class SpyreVisionEncoderMixin:
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """Copy the encoder output to the host once, then ``vision_finalize`` it into ``dest``.
+        """Upstream's default: slice the host output into ``dest`` by each item's rows.
 
-        Host-side because device views at row offsets off the stick read as offset 0
-        (torch-spyre#3770), and the embedding merge runs on the host anyway.
+        Override, as upstream models do, when placeholders differ from encoder rows (e.g.
+        unpadding or newline rows): ``outputs["default"]`` is already on the host.
         """
-        out = convert(outputs["default"], device="cpu")
-        items = self.vision_finalize(
-            out, [per_item_out_tokens[i] for i in indices], batch_mm_kwargs or {}
-        )
-        for idx, item in zip(indices, items, strict=True):
-            dest[idx] = item.clone() if clone else item
+        scatter_output_slices(outputs["default"], indices, per_item_out_tokens, dest, clone)
 
     def embed_multimodal(self, **kwargs: object) -> Any:
         """Upstream's entry point when the encoder manager is not used (eager mode, profiling):
