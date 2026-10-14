@@ -5,11 +5,13 @@
 To load the plugin, set the `VLLM_PLUGINS` environment variable before running vLLM:
 
 ```bash
-export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+export VLLM_PLUGINS=spyre_inference
 ```
 
-`spyre_inference` activates the platform, and `spyre_inference_ops` registers the OOT
-custom ops plus the Spyre Transformers backend (used for `model_impl="transformers"`).
+`spyre_inference` names both the platform plugin and the general plugin: the first
+activates the platform, and the second registers the OOT custom ops and the Spyre
+model adaptations, including the Spyre Transformers backend (used for
+`model_impl="transformers"`).
 
 ## Usage
 
