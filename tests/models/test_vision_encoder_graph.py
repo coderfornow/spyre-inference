@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 import torch
 import torch.nn as nn
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
@@ -37,6 +38,11 @@ class _Upstream(nn.Module):
 
     def embed_multimodal(self, **kwargs):
         return ("upstream",)
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        """Text rows ``[T, 8]`` holding each token id; records what upstream was handed."""
+        self.text_calls = [*getattr(self, "text_calls", []), (multimodal_embeddings, is_multimodal)]
+        return input_ids.to(torch.float16)[:, None].expand(-1, 8).contiguous()
 
 
 class _Block(nn.Module):
@@ -364,10 +370,13 @@ def test_each_path_compiles_and_replays_from_its_own_staging():
 
 def test_runner_warmup_builds_the_manager_and_serves_through_it():
     """The runner path: _record_vision_graphs compiles the model, builds the Spyre manager
-    from the processor's largest item and captures every budget."""
+    from the processor's largest item, captures every budget and warms the merge."""
     from vllm.config import CompilationMode
 
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+    from spyre_inference.v1.worker.spyre_model_runner import (
+        TorchSpyreModelRunner,
+        _SpyreModelWrapper,
+    )
 
     model = _FakeVisionModel()
     compiled = []
@@ -383,7 +392,18 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     runner.compilation_config = vllm_config.compilation_config
     runner.model_config = vllm_config.model_config
     runner.supports_mm_inputs = True
-    runner.model = SimpleNamespace(_model=model)
+    runner.model = _SpyreModelWrapper(
+        model,
+        torch.device("cpu"),
+        model_dtype=torch.float16,
+        inputs_embeds_buffer=torch.zeros(16, 8, dtype=torch.float16),
+    )
+    runner.spyre_shape_bucketer = SimpleNamespace(bucket_sizes=[1, 4, 16])
+    merged = []
+    merge = model.vision_merge
+    model.vision_merge = lambda text, image, mask: merged.append(text.shape[0]) or merge(
+        text, image, mask
+    )
     runner.mm_budget = SimpleNamespace(mm_max_toks_per_item={"image": 300})
     runner._spyre_device = torch.device("cpu")
     runner.encoder_cudagraph_manager = None
@@ -399,3 +419,169 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     outputs = manager.execute({"tokens": [10, 30]})
     assert [o.shape[0] for o in outputs] == [10, 30]
     assert manager.graph_hits == 2 and manager.graph_misses == 0
+    # Every bucket an image step can reach; the one-token bucket is never one.
+    assert merged == [4, 16]
+
+
+def _prompt(mask_rows: list[int], num_tokens: int = 12):
+    is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
+    is_multimodal[mask_rows] = True
+    return torch.arange(100, 100 + num_tokens), is_multimodal
+
+
+def test_merge_matches_upstream_merge_for_several_images():
+    """Two images' rows, out of order in the prompt, land where upstream's merge puts them."""
+    from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+    model = _FakeVisionModel()
+    input_ids, is_multimodal = _prompt([1, 2, 3, 7, 8])
+    images = [torch.randn(3, 8).half(), torch.randn(2, 8).half()]
+
+    got = model.embed_input_ids(input_ids, images, is_multimodal=is_multimodal)
+    text = input_ids.to(torch.float16)[:, None].expand(-1, 8).clone()
+    want = _merge_multimodal_embeddings(text, images, is_multimodal)
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def test_upstream_text_chain_runs_without_image_tokens():
+    """Upstream gets ``is_multimodal`` (out-of-vocabulary placeholders) but no image tokens, so
+    its own merge never runs."""
+    model = _FakeVisionModel()
+    input_ids, is_multimodal = _prompt([0])
+    model.embed_input_ids(input_ids, [torch.ones(1, 8).half()], is_multimodal=is_multimodal)
+    ((passed_images, passed_mask),) = model.text_calls
+    assert passed_images == ()
+    assert passed_mask is is_multimodal
+
+
+def test_text_only_steps_skip_the_merge():
+    model = _FakeVisionModel()
+    model.vision_merge = lambda *args: pytest.fail("merged a step with no image tokens")
+    input_ids, _ = _prompt([])
+    out = model.embed_input_ids(input_ids, (), is_multimodal=None)
+    assert out.shape == (12, 8)
+
+
+def test_count_mismatch_fails_like_upstream():
+    model = _FakeVisionModel()
+    input_ids, is_multimodal = _prompt([1, 2, 3])
+    with pytest.raises(ValueError, match="2 multimodal tokens to 3 placeholders"):
+        model.embed_input_ids(input_ids, [torch.ones(2, 8).half()], is_multimodal=is_multimodal)
+
+
+def test_vision_merge_override_receives_the_placed_rows():
+    model = _FakeVisionModel()
+    seen = []
+
+    def merge(text, image, mask):
+        seen.append((image.clone(), mask.clone()))
+        return text
+
+    model.vision_merge = merge
+    input_ids, is_multimodal = _prompt([4, 5])
+    model.embed_input_ids(input_ids, [torch.full((2, 8), 3.0).half()], is_multimodal=is_multimodal)
+    ((image, mask),) = seen
+    assert mask.shape == (12, 1) and mask[:, 0].tolist() == is_multimodal.tolist()
+    assert image[4:6].eq(3).all() and image[mask[:, 0].logical_not()].eq(0).all()
+
+
+def test_upstream_returns_text_alone_when_handed_no_image_tokens():
+    """The mixin relies on upstream's ``embed_input_ids`` returning before its merge for an
+    empty embedding list; if that changes, image tokens would merge twice."""
+    from vllm.model_executor.models import utils as vllm_utils
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
+    text = torch.randn(4, 8)
+    host = SimpleNamespace(
+        _has_oov_mm_tokens=False,
+        get_language_model=lambda: SimpleNamespace(embed_input_ids=lambda ids: text),
+        _embed_text_input_ids=lambda ids,
+        embed,
+        is_multimodal: SupportsMultiModal._embed_text_input_ids(
+            host, ids, embed, is_multimodal=is_multimodal
+        ),
+    )
+    original = vllm_utils._merge_multimodal_embeddings
+    vllm_utils._merge_multimodal_embeddings = lambda *a, **k: pytest.fail("upstream merged")
+    try:
+        out = SupportsMultiModal.embed_input_ids(
+            host,
+            torch.zeros(4, dtype=torch.long),
+            (),
+            is_multimodal=torch.ones(4, dtype=torch.bool),
+        )
+    finally:
+        vllm_utils._merge_multimodal_embeddings = original
+    assert out is text
+
+
+def test_wrapper_stages_an_image_step_at_two_rows_and_keeps_the_mask_on_the_host():
+    """A one-token image step (a chunk ending on a placeholder) stages two rows, so neither the
+    staging copy nor upstream's copy is a single row (torch-spyre#4883)."""
+    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+
+    model = _FakeVisionModel()
+    seen = []
+    merge = model.vision_merge
+
+    def recording_merge(text, image, mask):
+        seen.append(text.shape[0])
+        return merge(text, image, mask)
+
+    model.vision_merge = recording_merge
+    buf = torch.zeros(16, 8, dtype=torch.float16)
+    wrapper = _SpyreModelWrapper(
+        model, torch.device("cpu"), model_dtype=torch.float16, inputs_embeds_buffer=buf
+    )
+    out = wrapper.embed_input_ids(
+        torch.tensor([7]), [torch.full((1, 8), 5.0).half()], is_multimodal=torch.tensor([True])
+    )
+    assert seen == [2]
+    assert out.shape == (1, 8) and out.data_ptr() == buf.data_ptr()
+    assert out.eq(5).all()
+    ((_, mask),) = model.text_calls
+    assert mask.device.type == "cpu"
+
+
+@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
+@pytest.mark.parametrize("num_tokens", [1, 2, 63, 64, 65, 128])
+def test_compiled_merge_through_the_wrapper_on_spyre(monkeypatch, num_tokens):
+    """Text rows on the card, image rows placed on the host, merged by the compiled graph and
+    staged through the wrapper's buffer: the rows match a host merge exactly."""
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+
+    hidden = 128
+    torch.manual_seed(0)
+    text_host = torch.randn(256, hidden).half()
+    # Upstream's text embedding: rows of a device table, one per prompt position.
+    monkeypatch.setattr(
+        _Upstream,
+        "embed_input_ids",
+        lambda self, ids, mm=None, *, is_multimodal=None: convert(
+            text_host[: ids.shape[0]], device="spyre"
+        ),
+    )
+    model = _FakeVisionModel()
+    model.out_hidden_size = hidden
+    model.compile_vision_graphs()
+    buf = convert(torch.zeros(256, hidden, dtype=torch.float16), device="spyre")
+    wrapper = _SpyreModelWrapper(
+        model, torch.device("spyre"), model_dtype=torch.float16, inputs_embeds_buffer=buf
+    )
+    is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
+    is_multimodal[num_tokens // 3 :: 2] = True
+    image = torch.randn(int(is_multimodal.sum()), hidden).half()
+
+    with torch.inference_mode():
+        out = wrapper.embed_input_ids(
+            torch.arange(num_tokens), [image], is_multimodal=is_multimodal
+        )
+        got = convert(out, device="cpu")
+
+    want = text_host[:num_tokens].clone()
+    want[is_multimodal] = image
+    # Against the card's rounding of both sources (see the GatherTable test on Spyre).
+    want = convert(convert(want, device="spyre"), device="cpu")
+    assert got.shape == (num_tokens, hidden)
+    assert torch.equal(got, want)

@@ -524,18 +524,26 @@ class _SpyreModelWrapper:
         # boolean-mask ops are handled inside the model's own patch (e.g.
         # patch_embed_input_ids for Granite4Vision).
         num_tokens = input_ids.shape[0]
+        vision = isinstance(self._model, SpyreVisionEncoderMixin)
+        # An image step stages at least two rows: a one-row copy out of the merge's layout
+        # fails (torch-spyre#4883).
+        merges = vision and multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        target = max(num_tokens, 2) if merges else num_tokens
         bucketer = self._shape_bucketer
-        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if bucketer is not None:
+            padded_tokens = bucketer.find_bucket(target)
+        else:
+            padded_tokens = target if target != num_tokens else None
         if padded_tokens is not None and padded_tokens != num_tokens:
             input_ids = F.pad(input_ids, (0, padded_tokens - num_tokens))
             if is_multimodal is not None:
                 is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        is_multimodal = self._to_spyre(is_multimodal)
-        # Their encoder output is already on the host, where the merge scatters it;
-        # uploading first would compile a device concat per distinct row count.
-        if not isinstance(self._model, SpyreVisionEncoderMixin):
+        # These place their image tokens on the host (``SpyreVisionEncoderMixin.embed_input_ids``),
+        # where their encoder output already is, so neither goes to the card here.
+        if not vision:
+            is_multimodal = self._to_spyre(is_multimodal)
             multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
 
         result = self._model.embed_input_ids(
@@ -1023,6 +1031,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self._maybe_init_encoder_cudagraph_manager()
             assert self.encoder_cudagraph_manager is not None
             self.encoder_cudagraph_manager.capture(graph_pool=None)
+            self._warmup_vision_merge(model)
+
+    def _warmup_vision_merge(self, model: SpyreVisionEncoderMixin) -> None:
+        """Compile ``vision_merge`` at every token bucket an image step can land on."""
+        bucketer = self.spyre_shape_bucketer
+        if bucketer is None:
+            return
+        wrapper = cast(_SpyreModelWrapper, self.model)
+        image_rows = [torch.zeros(1, model.out_hidden_size, dtype=self._model_dtype())]
+        # Image steps stage at least two rows (see _SpyreModelWrapper.embed_input_ids), so a
+        # bucket below two is never reached.
+        for size in bucketer.bucket_sizes:
+            if size < 2:
+                continue
+            is_multimodal = torch.zeros(size, dtype=torch.bool)
+            is_multimodal[0] = True
+            wrapper.embed_input_ids(
+                torch.zeros(size, dtype=torch.int32), image_rows, is_multimodal=is_multimodal
+            )
+        logger.info("Vision merge compiled at every token bucket.")
 
     def _compiled_vision_model(self) -> SpyreVisionEncoderMixin | None:
         if not self.supports_mm_inputs or self.compilation_config.mode is CompilationMode.NONE:
@@ -1066,14 +1094,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         input_ids = torch.zeros(num_tokens, dtype=torch.int32)
         model.embed_input_ids(input_ids)
         logger.info_once("Warming the input embedding through embed_input_ids.")
-        vision = model._model
-        if isinstance(vision, SpyreVisionEncoderMixin):
-            # The image merge's device select compiles per token bucket, and only a
-            # step that schedules image placeholders reaches it.
-            is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
-            is_multimodal[0] = True
-            image_rows = [torch.zeros(1, vision.out_hidden_size, dtype=self._model_dtype())]
-            model.embed_input_ids(input_ids, image_rows, is_multimodal=is_multimodal)
 
     @torch.inference_mode()
     def _warmup_multimodal_encoder(self) -> None:

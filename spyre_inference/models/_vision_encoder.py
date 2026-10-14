@@ -25,6 +25,9 @@ serving) is shared. The encoder runs in three graphs, compiled once per upstream
 
 Units follow upstream: an *image token* is one position of ``vision_project``'s output, the unit
 of the token budgets, and every image token is ``patches_per_token`` patches.
+
+The image tokens then merge into the prompt embeddings in ``embed_input_ids``: placed on the
+host, combined on the card by ``vision_merge``, a fourth graph compiled per token bucket.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 import torch.nn as nn
+from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
@@ -201,6 +205,18 @@ class SpyreVisionEncoderMixin:
         """
         return block(x, **block_kwargs)
 
+    def vision_merge(
+        self, text: torch.Tensor, image: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Graph 4: combine the prompt's text and image embeddings, both ``[T, H]``.
+
+        ``image`` holds each image token at its placeholder row and zeros elsewhere; ``mask``
+        is ``[T, 1]``, true at those rows. Default: the image rows where ``mask`` is set.
+        Override when the model's upstream merge does more (e.g. Granite Vision's
+        deepstack features).
+        """
+        return torch.where(mask, image, text)
+
     # --- 3. Used by the runner ---
 
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
@@ -208,15 +224,17 @@ class SpyreVisionEncoderMixin:
     max_tokens_per_item: int
 
     def compile_vision_graphs(self) -> None:
-        """Compile ``vision_embed``, every layer and ``vision_project`` with static shapes and
-        register them with the compile guard. Called at warmup; a repeat call is a no-op."""
+        """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with
+        static shapes and register them with the compile guard. Called at warmup; a repeat call
+        is a no-op."""
         if hasattr(self, "_spyre_vision_embed"):
             return
         compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
         self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
-        compile_guard.watch(self._spyre_vision_embed, f"{type(self).__name__}.vision_embed")
-        compile_guard.watch(self._spyre_vision_project, f"{type(self).__name__}.vision_project")
+        self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
+        for name in ("vision_embed", "vision_project", "vision_merge"):
+            compile_guard.watch(getattr(self, f"_spyre_{name}"), f"{type(self).__name__}.{name}")
         for block in self.vision_blocks():
             block.compile(**compile_kwargs)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
@@ -354,6 +372,41 @@ class SpyreVisionEncoderMixin:
             {"default": output}, list(range(len(tokens))), tokens, dest, batch_mm_kwargs=kwargs
         )
         return tuple(t for t in dest if t is not None)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Upstream's text embedding, then the merge through ``vision_merge``.
+
+        Upstream's chain runs with no image tokens, so model overrides and its handling of
+        out-of-vocabulary placeholders still apply, and it returns before its own merge. The
+        image tokens arrive on the host: they are placed there at the bucketed ``[T, H]``, so
+        the card sees one shape per token bucket whatever the image token count.
+        """
+        text = super().embed_input_ids(  # ty: ignore[unresolved-attribute]
+            input_ids, (), is_multimodal=is_multimodal
+        )
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return text
+        assert is_multimodal is not None, "image tokens need is_multimodal"
+        mask = convert(is_multimodal, device="cpu")
+        rows = convert(vllm_utils._flatten_embeddings(multimodal_embeddings), device="cpu")
+        if rows.shape[0] != int(mask.sum()):
+            expr = vllm_utils._embedding_count_expression(multimodal_embeddings)
+            raise ValueError(
+                f"Attempted to assign {expr} = {rows.shape[0]} multimodal tokens to "
+                f"{int(mask.sum())} placeholders"
+            )
+        image = torch.zeros(text.shape, dtype=text.dtype)
+        image[mask] = rows.to(text.dtype)
+        merge = getattr(self, "_spyre_vision_merge", self.vision_merge)
+        return merge(
+            text, convert(image, device=text.device), convert(mask[:, None], device=text.device)
+        )
 
     # --- Private helpers ---
 
