@@ -18,7 +18,7 @@ A vision model subclasses its upstream class with ``SpyreVisionEncoderMixin`` ah
 implements the hooks in the mixin's first section; everything else (the protocol, warmup,
 serving) is shared. The encoder runs in three graphs, compiled once per upstream token budget:
 
-    host:   vision_inputs     items -> fp16 buffers, one entry per patch
+    host:   vision_inputs     items -> buffers, one entry per patch
     graph:  vision_embed      patches -> the blocks' input embeddings
     graph:  vision_blocks     the repeated encoder layers
     graph:  vision_project    merge or pool, then project into the text model's space
@@ -44,7 +44,7 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderItemSpec,
 )
 
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, place_row_gathered
 from spyre_inference.multimodal.utils import STICK, align_up
 from spyre_inference.v1.worker import compile_guard
 
@@ -54,13 +54,36 @@ if TYPE_CHECKING:
 
 @dataclass
 class VisionBuffer:
-    """One fp16 encoder input, ``[P]`` or ``[P, width]`` over ``P`` patch slots.
+    """One encoder input, ``[P]`` or ``[P, width]`` over ``P`` patch slots.
 
     ``pad`` is the value of the slots a budget adds: a scalar, or one ``[width]`` row.
+    ``dtype`` is fp16 for activations; integer buffers carry indices (e.g. positions).
     """
 
     width: int | None
     pad: float | torch.Tensor = 0.0
+    dtype: torch.dtype = torch.float16
+
+
+class GatherTable(nn.Module):
+    """A ``[rows, width]`` lookup table that a vision graph gathers rows from by index.
+
+    Stays on the host until the model moves to the card, then is placed with its rows
+    outermost, the layout torch-spyre's gather needs. Use it for per-patch lookups such as
+    RoPE, so the host uploads indices instead of the gathered rows.
+    """
+
+    def __init__(self, table: torch.Tensor) -> None:
+        super().__init__()
+        self.table = table
+
+    def _apply(self, fn, recurse=True):
+        self.table = place_row_gathered(self.table, fn, type(self).__name__)
+        return self
+
+    def gather(self, index: torch.Tensor) -> torch.Tensor:
+        """The rows at ``index``."""
+        return self.table.index_select(0, index)
 
 
 def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
@@ -88,7 +111,7 @@ class SpyreVisionEncoderMixin:
 
     # --- 1. What a model provides ---
 
-    # Host inputs by name, each fp16 ``[P]`` or ``[P, width]``.
+    # Host inputs by name, each ``[P]`` or ``[P, width]``: fp16 activations or integer indices.
     vision_buffers: dict[str, VisionBuffer]
     # Patches per image token: the merge or pool factor (``M**2``), 1 if none.
     patches_per_token: int
@@ -104,7 +127,7 @@ class SpyreVisionEncoderMixin:
         raise NotImplementedError
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Host-side preparation: one unpadded fp16 tensor per ``vision_buffers`` key.
+        """Host-side preparation: one unpadded tensor per ``vision_buffers`` key, of its dtype.
 
         All tensors share one patch count; the mixin pads them to a budget. When
         ``vision_project`` merges or pools, lay patches out offset-major (``offset_major``).
@@ -333,12 +356,12 @@ class SpyreVisionEncoderMixin:
         out = {}
         for key, buf in self.vision_buffers.items():
             shape = (num_patches,) if buf.width is None else (num_patches, buf.width)
-            out[key] = torch.empty(shape, dtype=torch.float16)
+            out[key] = torch.empty(shape, dtype=buf.dtype)
             out[key][:] = buf.pad
         return out
 
     def _checked_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """``vision_inputs``, validated: every declared key, fp16, one patch count."""
+        """``vision_inputs``, validated: every declared key, its declared dtype, one patch count."""
         values = self.vision_inputs(mm_kwargs)
         if set(values) != set(self.vision_buffers):
             raise ValueError(
@@ -346,8 +369,12 @@ class SpyreVisionEncoderMixin:
                 f"vision_buffers declares {sorted(self.vision_buffers)}"
             )
         counts = {v.shape[0] for v in values.values()}
-        if len(counts) != 1 or any(v.dtype != torch.float16 for v in values.values()):
-            raise ValueError("vision_inputs must return fp16 buffers with one patch count")
+        wrong = [k for k, v in values.items() if v.dtype != self.vision_buffers[k].dtype]
+        if len(counts) != 1 or wrong:
+            raise ValueError(
+                f"vision_inputs must return one patch count and the declared dtypes; got "
+                f"counts {sorted(counts)}, wrong dtype for {wrong}"
+            )
         return values
 
 

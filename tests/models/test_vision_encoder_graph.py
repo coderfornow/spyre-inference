@@ -160,7 +160,7 @@ def test_inputs_must_be_fp16_with_one_patch_count():
         "patches": torch.zeros(4, 8),
         "segments": torch.zeros(4, dtype=torch.float16),
     }
-    with pytest.raises(ValueError, match="fp16"):
+    with pytest.raises(ValueError, match="declared dtypes"):
         model.prepare_encoder_cudagraph_replay_buffers({"tokens": [1]}, 0, 0)
 
 
@@ -224,3 +224,37 @@ def test_budget_range_override_sets_the_largest_budget():
 
 def test_other_modalities_go_to_upstream():
     assert _FakeVisionModel().embed_multimodal(modality="audio") == ("upstream",)
+
+
+def test_integer_buffers_keep_their_dtype_and_padding():
+    """Index buffers (e.g. positions) are padded and validated in their declared dtype."""
+    model = _FakeVisionModel()
+    model.vision_buffers = {
+        **model.vision_buffers,
+        "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
+    }
+    bufs = model._vision_empty(64)
+    assert bufs["positions"].dtype == torch.int64
+
+    inputs = model.vision_inputs
+
+    def with_positions(mm_kwargs):
+        values = inputs(mm_kwargs)
+        return {**values, "positions": torch.arange(values["patches"].shape[0])}
+
+    model.vision_inputs = with_positions
+    values = model.prepare_encoder_cudagraph_replay_buffers({"tokens": [10]}, 0, 0).values
+    model.get_encoder_cudagraph_config().padding_logics["positions"](
+        bufs["positions"], values["positions"]
+    )
+    assert bufs["positions"].view(MERGE_PATCHES, -1)[:, 10:].eq(0).all()
+
+
+def test_gather_table_gathers_rows_on_the_host():
+    from spyre_inference.models._vision_encoder import GatherTable
+
+    table = GatherTable(torch.arange(12.0).reshape(4, 3))
+    torch.testing.assert_close(
+        table.gather(torch.tensor([2, 0])), torch.tensor([[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]])
+    )
+    assert table.half().table.dtype == torch.float16

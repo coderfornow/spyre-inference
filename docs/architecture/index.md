@@ -278,9 +278,9 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 
 | Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) |
 |---|---|---|---|
-| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | fp16 host inputs and their padding values; patches per image token; output width | patches, one-hot segments, cos, sin; `M²`; text hidden size |
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size |
 | `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, gathered RoPE |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions |
 | `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
 | `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
 | `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter |
@@ -314,9 +314,10 @@ Constraints the layout follows:
 - The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
   column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
   cannot lay out.
-- RoPE cos/sin are gathered by position on the host and enter as graph inputs; the rotation is
-  a matmul against a constant pair-swap matrix, since a 64-wide head's 32-wide halves cannot
-  be sliced.
+- RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
+  `GatherTable` (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
+  one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
+  64-wide head's 32-wide halves cannot be sliced.
 - The encoder output comes back to the host in one copy and is sliced there: device views
   at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
   runs on the host anyway.

@@ -18,7 +18,8 @@
 decoder, and adds the ``SpyreVisionEncoderMixin`` hooks:
 
 - attention: ``SpyrePixtralAttention``, with RoPE as a matmul and the stick-aligned SDPA;
-- inputs: patches laid out offset-major on the host, with each patch's image and RoPE;
+- inputs: patches laid out offset-major on the host, with each patch's image and position;
+- RoPE: cos and sin gathered on the card by position, from a ``GatherTable``;
 - patch embedding: the conv folded into a linear at load time;
 - patch merge: a batched matmul over the offset groups, in place of upstream's ``unfold``.
 
@@ -38,6 +39,7 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
+    GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
     offset_major,
@@ -61,8 +63,8 @@ _MASK_MIN = torch.finfo(torch.float16).min / 2
 class SpyrePixtralAttention(pixtral.Attention):
     """Upstream's vision attention with RoPE as a matmul and the stick-aligned SDPA.
 
-    ``freqs_cis`` is a ``(cos, sin)`` pair gathered on the host instead of upstream's complex
-    table, since Spyre has no complex dtype.
+    ``freqs_cis`` is a ``(cos, sin)`` pair of real tables instead of upstream's complex one,
+    since Spyre has no complex dtype.
     """
 
     rope_perm: torch.Tensor
@@ -158,12 +160,12 @@ class SpyrePixtralForConditionalGeneration(
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
             "segments": VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half()),
-            "cos": VisionBuffer(head_dim),
-            "sin": VisionBuffer(head_dim),
+            "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
-        self._rope_cos, self._rope_sin = pixtral_rope_tables(
-            head_dim, self._max_side, args.rope_theta
-        )
+        # [cos | sin] per position, gathered on the card in vision_embed.
+        cos, sin = pixtral_rope_tables(head_dim, self._max_side, args.rope_theta)
+        self.spyre_rope_table = GatherTable(torch.cat([cos, sin], dim=-1).half())
+        self._head_dim = head_dim
 
         # With an image limit of 0, upstream leaves a placeholder instead of the tower.
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
@@ -215,7 +217,7 @@ class SpyrePixtralForConditionalGeneration(
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Offset-major patches of every image, each flattened as ``(c, py, px)`` like the conv
-        weight, with its one-hot image and its RoPE cos and sin."""
+        weight, with its one-hot image and its RoPE position."""
         images = _images(mm_kwargs)
         p, m = self.vision_args.patch_size, self._merge
         flat_patches, seg, pos = [], [], []
@@ -229,12 +231,10 @@ class SpyrePixtralForConditionalGeneration(
             pos.append(offset_major(grid, m))
             seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
         flat = torch.cat(flat_patches, dim=1).flatten(0, 1).to(torch.float16)
-        positions = torch.cat(pos, dim=1).flatten()
         return {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
             "segments": F.one_hot(torch.cat(seg, dim=1).flatten(), STICK).to(torch.float16),
-            "cos": self._rope_cos[positions].to(torch.float16),
-            "sin": self._rope_sin[positions].to(torch.float16),
+            "positions": torch.cat(pos, dim=1).flatten().to(torch.int64),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -244,7 +244,9 @@ class SpyrePixtralForConditionalGeneration(
         # Same-image mask as a matmul: Spyre cannot lay out a column-minus-row broadcast.
         segments = values["segments"]
         mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
-        return x, {"mask": mask, "freqs_cis": (values["cos"], values["sin"])}
+        rope = self.spyre_rope_table.gather(values["positions"])
+        freqs_cis = (rope[:, : self._head_dim], rope[:, self._head_dim :])
+        return x, {"mask": mask, "freqs_cis": freqs_cis}
 
     def vision_blocks(self) -> nn.ModuleList:
         return self.vision_encoder.transformer.layers
