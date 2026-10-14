@@ -73,9 +73,14 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 f"item ({largest_item} tokens), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
-        # Respect a layout limit on items per encoder call when packing.
-        if model.vision_max_items_per_call is not None:
-            self.max_batch_size = min(self.max_batch_size, model.vision_max_items_per_call)
+        # Respect a layout limit on items per encoder call when packing. Upstream derived the
+        # frame limit from the wider item count, so it shrinks with it.
+        cap = model.vision_max_items_per_call
+        if cap is not None and cap < self.max_batch_size:
+            self.max_batch_size = cap
+            self.max_frames_per_batch = min(
+                self.max_frames_per_batch, cap * self.config.max_frames_per_video
+            )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
     def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:

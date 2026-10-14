@@ -131,7 +131,8 @@ def padded_sdpa(
     padded, or when the model carries its own scale.
 
     `mask=None` attends everywhere: only the padded keys are masked, and that path
-    is safe inside a compiled block.
+    is safe inside a compiled block. A float `mask` is additive, as in
+    `F.scaled_dot_product_attention`; one already aligned and on the card is used as is.
     """
     b, _, seq, d = q.shape
     if scale is None:

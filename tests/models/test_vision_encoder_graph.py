@@ -15,6 +15,7 @@
 """The ``SpyreVisionEncoderMixin`` contract and ``SpyreEncoderGraphManager``, on CPU with a
 fake model: what a model author can rely on without touching any other file."""
 
+import dataclasses
 from types import SimpleNamespace
 from typing import Any
 
@@ -84,7 +85,7 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return x.reshape(MERGE_PATCHES, -1, x.shape[-1]).mean(dim=0)
 
 
-def _vllm_config(budgets=None, tp_mode="weights"):
+def _vllm_config(budgets=None, tp_mode="weights", videos=0):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
@@ -93,7 +94,7 @@ def _vllm_config(budgets=None, tp_mode="weights"):
         ),
         model_config=SimpleNamespace(
             multimodal_config=SimpleNamespace(
-                get_limit_per_prompt=lambda modality: 0 if modality == "video" else 4,
+                get_limit_per_prompt=lambda modality: videos if modality == "video" else 4,
                 mm_encoder_tp_mode=tp_mode,
             )
         ),
@@ -177,6 +178,20 @@ def test_items_per_call_cap_splits_the_batch():
     assert manager.max_batch_size == 1
     assert len(model.forward_patches) == 2
     assert [o.shape[0] for o in outputs] == [10, 30]
+
+
+def test_items_per_call_cap_also_caps_the_frames():
+    """Upstream sizes the frame limit from the uncapped item count before the cap applies."""
+    model = _FakeVisionModel()
+    config = model.get_encoder_cudagraph_config()
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, max_frames_per_video=8)
+    type(model).vision_max_items_per_call = 2
+    try:
+        manager = _manager(model, videos=1)
+    finally:
+        del type(model).vision_max_items_per_call
+    assert manager.max_batch_size == 2
+    assert manager.max_frames_per_batch == 2 * 8
 
 
 def test_taps_reach_vision_project_in_declared_order():
