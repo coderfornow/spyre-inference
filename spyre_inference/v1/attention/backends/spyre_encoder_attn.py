@@ -42,6 +42,7 @@ import types
 import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -483,6 +484,70 @@ def build_encoder_plan(
             plans.append(plan(group[offset : offset + chunk], extent))
             offset += chunk
     return plans
+
+
+def forced_rect_plan(
+    extent: int, width: int, dtype: torch.dtype, device: torch.device, causal: bool
+) -> EncoderRectPlan:
+    """Warmup's declared rectangle, ignoring the dummy batch's own shape.
+
+    Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
+    ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
+    ``sum(query_lens)`` the body row count, which keeps the grid expansion an identity.
+    The mask takes the group's causality, as its real plans do.
+    """
+    return EncoderRectPlan(
+        extent=extent,
+        width=width,
+        mask=convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device),
+        query_lens=[extent] * width,
+    )
+
+
+def plan_encoder_step(
+    metadatas: Iterable[object],
+    *,
+    rectangles: Sequence[tuple[int, int]],
+    width_cap_for: dict[int, int],
+    device: torch.device,
+    dtype: torch.dtype,
+    batched: bool,
+    forced_rect: tuple[int, int] | None = None,
+) -> EncoderRectPlan | list[EncoderGroupPlan] | None:
+    """Give each encoder metadata object its own plan, with its own causality; return the last."""
+    plan = None
+    seen: set[int] = set()
+    causal: set[bool] = set()
+    for md in metadatas:
+        if id(md) in seen or not hasattr(md, "encoder_plan"):
+            continue
+        seen.add(id(md))
+        encoder_md = cast(SpyreAttentionMetadata, md)
+        causal.add(encoder_md.apply_causal_mask)
+        if encoder_md.encoder_plan is None:
+            if forced_rect is not None:
+                plan = forced_rect_plan(*forced_rect, dtype, device, encoder_md.apply_causal_mask)
+            else:
+                plan = build_encoder_plan(
+                    encoder_md,
+                    rectangles=rectangles,
+                    width_cap_for=width_cap_for,
+                    device=device,
+                    dtype=dtype,
+                    batched=batched,
+                )
+            encoder_md.encoder_plan = plan
+        else:
+            plan = encoder_md.encoder_plan
+
+    # The traced rectangle reads one published mask in every inlined layer, so groups
+    # that differ in causality cannot share it.
+    if isinstance(plan, EncoderRectPlan) and encoder_inline_active() and len(causal) > 1:
+        raise NotImplementedError(
+            "Encoder attention groups mix causal and bidirectional masks; the traced "
+            "rectangle path publishes one mask for all of them."
+        )
+    return plan
 
 
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):

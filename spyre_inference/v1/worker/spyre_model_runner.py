@@ -93,7 +93,6 @@ from spyre_inference.multimodal.utils import blocks_marked_compilable
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
-    SpyreAttentionMetadata,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
@@ -120,17 +119,16 @@ from spyre_inference.v1.pool.spyre_pooler import (
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.encoder_grid import EncoderDispatchStats, expand_body_to_grid
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
-    encoder_grid_source_rows,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
     encoder_rectangles,
     encoder_shape_tables,
-    expand_packed_to_encoder_grid,
     expand_packed_token_types,
     logits_row_buckets,
 )
@@ -142,9 +140,6 @@ logger = init_logger(__name__)
 # (unavailable with VLLM_TARGET_DEVICE=empty).
 
 _PAD_SLOT_ID = -1
-
-# Steps between encoder dispatch-ratio log lines.
-_ENCODER_DISPATCH_LOG_EVERY = 200
 
 
 def _compute_slot_mapping_impl(
@@ -618,11 +613,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Warmup only; see _warm_encoder_inline_paths.
         self._forced_encoder_rect: tuple[int, int] | None = None
         self._force_encoder_ragged = False
-        self.spyre_encoder_rect_steps = 0
-        self.spyre_encoder_ragged_steps = 0
-        self.spyre_encoder_real_tokens = 0
-        self.spyre_encoder_body_rows = 0
-        self.spyre_encoder_seqs = 0
+        self.spyre_encoder_stats = EncoderDispatchStats()
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -742,7 +733,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._compile_for_spyre()
 
         # Initialize bucket dispatcher for shape bucketing at runtime.
-        self.spyre_shape_bucketer = self._create_shape_bucketer()
+        self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
 
         # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
         bucketer = self.spyre_shape_bucketer
@@ -789,31 +780,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if _is_fp8_kernel(getattr(module, "scheme", None)):
                 return True
         return False
-
-    def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
-        """Create SpyreShapeBucketer for 1D body token sizes.
-
-        Decoder and pooling share 1D ``compile_sizes``; pooling's is a single entry,
-        the token budget.
-
-        Pooling keeps a bucketer in eager *and* compile so *runtime* always
-        1D-pads the body. Warmup still differs: compile dummies each 1D size
-        (attention compiles through ``force_attention``); eager does one
-        dummy then ``mark_warmed_up()``. Decoder skips a bucketer when eager
-        because 1D pad exists only to hit compiled graphs.
-        """
-        if self.model_config.runner_type == "pooling":
-            return SpyreShapeBucketer.for_pooling(self.vllm_config)
-
-        if self.vllm_config.model_config.enforce_eager:
-            logger.info("Graph Recorder disabled (enforce_eager=True)")
-            return None
-
-        if not self.compilation_config.compile_sizes:
-            logger.info("Graph Recorder disabled (no compile_sizes configured)")
-            return None
-
-        return SpyreShapeBucketer(self.vllm_config)
 
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.
@@ -1259,8 +1225,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return out
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
-            build_encoder_plan,
-            encoder_inline_active,
+            plan_encoder_step,
             publish_encoder_grid,
         )
 
@@ -1275,115 +1240,30 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         per_layer = out[0] if isinstance(out, tuple) else out
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
-        plan = None
-        seen: set[int] = set()
-        causal: set[bool] = set()
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            for md in group.values():
-                if id(md) in seen or not hasattr(md, "encoder_plan"):
-                    continue
-                seen.add(id(md))
-                encoder_md = cast(SpyreAttentionMetadata, md)
-                causal.add(encoder_md.apply_causal_mask)
-                if md.encoder_plan is None:
-                    plan = self._forced_encoder_plan(encoder_md) or build_encoder_plan(
-                        encoder_md,
-                        rectangles=rectangles,
-                        width_cap_for=self._encoder_width_caps,
-                        # self.device is CPU by design (see the class docstring); the
-                        # real device is _spyre_device.
-                        device=self._spyre_device,
-                        dtype=self._model_dtype(),
-                        # Grouping only pays off through the compiled kernels; the
-                        # eager per-request loop has no launch overhead to amortise.
-                        batched=self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE,
-                    )
-                    encoder_md.encoder_plan = plan
-                else:
-                    plan = md.encoder_plan
-
-        # The traced rectangle reads one published mask in every inlined layer, so groups
-        # that differ in causality cannot share it.
-        if isinstance(plan, EncoderRectPlan) and encoder_inline_active() and len(causal) > 1:
-            raise NotImplementedError(
-                "Encoder attention groups mix causal and bidirectional masks; the traced "
-                "rectangle path publishes one mask for all of them."
-            )
+        plan = plan_encoder_step(
+            (md for group in groups if isinstance(group, dict) for md in group.values()),
+            rectangles=rectangles,
+            width_cap_for=self._encoder_width_caps,
+            # self.device is CPU by design (see the class docstring); the real device is
+            # _spyre_device.
+            device=self._spyre_device,
+            dtype=self._model_dtype(),
+            # Grouping only pays off through the compiled kernels; the eager per-request
+            # loop has no launch overhead to amortise.
+            batched=self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE,
+            forced_rect=self._forced_encoder_rect,
+        )
         # A rectangle's mask shape is how a traced forward reads the grid; the ragged path
         # publishes nothing and so stays opaque.
         publish_encoder_grid(plan)
-        if isinstance(plan, EncoderRectPlan):
-            self._encoder_grid = (plan.extent, plan.width, plan.query_lens)
-            self.spyre_encoder_rect_steps += 1
-            self._record_encoder_dispatch(sum(plan.query_lens), len(plan.query_lens), rows)
-        else:
-            # Stale grid would silently mislay this step's tokens in `_preprocess`.
-            self._encoder_grid = None
-            if isinstance(plan, list):
-                self.spyre_encoder_ragged_steps += 1
-                self._record_encoder_dispatch(
-                    sum(sum(group.query_lens) for group in plan),
-                    sum(group.group for group in plan),
-                    rows,
-                )
+        # A stale grid would silently mislay this step's tokens in `_preprocess`.
+        self._encoder_grid = (
+            (plan.extent, plan.width, plan.query_lens)
+            if isinstance(plan, EncoderRectPlan)
+            else None
+        )
+        self.spyre_encoder_stats.record(plan, rows)
         return out
-
-    def _forced_encoder_plan(self, md: SpyreAttentionMetadata):
-        """Warmup's declared rectangle, ignoring the dummy batch's own shape.
-
-        Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
-        ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
-        ``sum(query_lens)`` the body row count, which keeps ``_preprocess``'s expansion an
-        identity. The mask takes ``md``'s causality, as the group's real plans do.
-        """
-        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
-            EncoderRectPlan,
-            encoder_key_pad_mask,
-        )
-
-        if self._forced_encoder_rect is None:
-            return None
-        extent, width = self._forced_encoder_rect
-        return EncoderRectPlan(
-            extent=extent,
-            width=width,
-            mask=convert(
-                encoder_key_pad_mask(
-                    extent, [extent] * width, self._model_dtype(), md.apply_causal_mask
-                ),
-                self._spyre_device,
-            ),
-            query_lens=[extent] * width,
-        )
-
-    def _record_encoder_dispatch(self, real_tokens: int, num_seqs: int, rows: int) -> None:
-        """Accumulate the dispatch ratio and body occupancy, and log them periodically.
-
-        The counters live in the worker process, so a log line is the only way they
-        reach whoever is running a benchmark. Occupancy is the number worth watching:
-        the body is one fixed shape, so a step that is narrow or short pays for rows it
-        does not use, and that is the cost the rectangular path trades away per-layer data
-        movement for.
-        """
-        self.spyre_encoder_real_tokens += real_tokens
-        self.spyre_encoder_body_rows += rows
-        self.spyre_encoder_seqs += num_seqs
-        steps = self.spyre_encoder_rect_steps + self.spyre_encoder_ragged_steps
-        if steps % _ENCODER_DISPATCH_LOG_EVERY:
-            return
-        logger.info(
-            "Encoder dispatch over %d steps: %d fast, %d slow; mean %.2f seqs/step; "
-            "body occupancy %.1f%% (%d real tokens in %d rows).",
-            steps,
-            self.spyre_encoder_rect_steps,
-            self.spyre_encoder_ragged_steps,
-            self.spyre_encoder_seqs / steps,
-            100.0 * self.spyre_encoder_real_tokens / max(1, self.spyre_encoder_body_rows),
-            self.spyre_encoder_real_tokens,
-            self.spyre_encoder_body_rows,
-        )
 
     def _determine_batch_execution_and_padding(
         self,
@@ -1450,12 +1330,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
-        if bucketer is None or not bucketer.is_warmed_up:
-            return None
-        desc = bucketer.dispatch(num_tokens)
-        if desc is None:
-            return None
-        return BatchDescriptor(num_tokens=desc.padded_num_tokens)
+        padded = bucketer.warmed_bucket(num_tokens) if bucketer is not None else None
+        return None if padded is None else BatchDescriptor(num_tokens=padded)
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
@@ -1695,10 +1571,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Upstream writes rows contiguously and the padding hook only sets the trailing
         pad count, so the interior per-sequence padding a rectangle needs has to
-        happen here. The `input_ids` path packs only integer tensors (tens of KB),
-        avoiding a per-layer activation gather. Multimodal pooling with only
-        `inputs_embeds` instead gathers the embeddings into the grid on the device,
-        with an index built on the host, so they never round-trip through the host.
+        happen here, through ``expand_body_to_grid``.
 
         On the packed path, absolute-position RoBERTa still offsets positions here
         before the embedding gather. ``query_start_loc`` and ``seq_lens`` keep the
@@ -1722,42 +1595,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         hf_config = getattr(self.model_config, "hf_config", None)
         position_offset = roberta_position_delta(hf_config)
 
-        if input_ids is not None:
-            ids, pos = expand_packed_to_encoder_grid(
-                input_ids[:num_tokens].cpu(),
-                positions[:num_tokens].cpu(),
-                query_lens,
-                width,
-                extent,
-                pad_token_id=self._encoder_pad_token_id(),
-                position_offset=position_offset,
-            )
-            assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
-            grid_ids = convert(ids, input_ids.device)
-            grid_embeds = inputs_embeds
-        else:
-            # A multimodal pooling model (e.g. CLIP) preprocesses straight to
-            # embeddings; expand those instead of ids. Positions still need the
-            # same padding, so reuse that helper with dummy ids (discarded).
-            assert inputs_embeds is not None, "upstream must supply ids or embeds"
-            _, pos = expand_packed_to_encoder_grid(
-                torch.zeros(num_tokens, dtype=torch.int64),
-                positions[:num_tokens].cpu(),
-                query_lens,
-                width,
-                extent,
-                position_offset=position_offset,
-            )
-            grid_ids = None
-            # Gathered from the whole body buffer, not a `[:num_tokens]` slice: the
-            # gather specialises on its source's row count, which then stays fixed.
-            grid_embeds = select_rows(
-                inputs_embeds,
-                torch.tensor(
-                    encoder_grid_source_rows(query_lens, width, extent), dtype=torch.int64
-                ),
-            )
-            assert grid_embeds.shape[0] == width * extent, (grid_embeds.shape[0], width * extent)
+        grid_ids, grid_embeds, grid_pos = expand_body_to_grid(
+            input_ids,
+            inputs_embeds,
+            positions,
+            grid,
+            pad_token_id=self._encoder_pad_token_id(),
+            position_offset=position_offset,
+        )
 
         # token_type_ids rides through `rest` in model_kwargs and is one value per packed
         # token, so it needs the same rearrangement or every sequence past the first gets
@@ -1782,12 +1627,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 }
             regrouped.append(model_kwargs)
 
-        return (
-            grid_ids,
-            grid_embeds,
-            convert(pos, positions.device),
-            *regrouped,
-        )
+        return (grid_ids, grid_embeds, grid_pos, *regrouped)
 
     def _offset_preprocess_positions(self, out: Any) -> Any:
         """Add the RoBERTa offset on the packed path, before the wrapper's H2D.

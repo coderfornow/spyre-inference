@@ -511,10 +511,11 @@ exactly the extents a request can be assigned):
    offsets are data. A group wider than the widest declared width is chunked into
    descending powers of two, so every dispatch lands on a warmed pair.
 
-The runner picks between them once per step in `_build_attention_metadata` and records the
-choice as the *type* of `attn_metadata.encoder_plan` (`EncoderRectPlan` versus a list of
-`EncoderGroupPlan`). It has to run there rather than in `forward`: the builder does a D2H
-read and H2D conversions, which inside a traced region become graph nodes.
+The runner picks between them once per step in `_build_attention_metadata`, through
+`plan_encoder_step`, and records the choice as the *type* of `attn_metadata.encoder_plan`
+(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). It has to run there rather than
+in `forward`: the builder does a D2H read and H2D conversions, which inside a traced
+region become graph nodes.
 
 The ragged path always stays behind the opaque `unified_attention_with_output`: it
 dispatches once per group, so tracing it in would make the block graph's structure depend on
