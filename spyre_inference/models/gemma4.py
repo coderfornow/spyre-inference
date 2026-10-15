@@ -106,6 +106,54 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
+def _gemma4_hf_config(engine_args: EngineArgs) -> Any | None:
+    """The checkpoint's config when it is gemma-4, else None.
+
+    Detected by config model_type, not the checkpoint name: derivatives such as
+    medgemma / translategemma carry a gemma4 config under an unrelated name. On any load
+    failure, defer to ModelConfig, which loads the same config and raises the real error.
+    """
+    from vllm.transformers_utils.config import get_config
+
+    try:
+        hf_config = get_config(
+            engine_args.hf_config_path or engine_args.model,
+            engine_args.trust_remote_code,
+            engine_args.revision,
+            engine_args.code_revision,
+            engine_args.config_format,
+            token=engine_args.hf_token,
+        )
+    except Exception:
+        return None
+    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return None
+    return hf_config
+
+
+def default_mm_limits(engine_args: EngineArgs) -> None:
+    """Default a gemma-4 vision checkpoint's video limit to 0, and refuse an explicit one.
+
+    Only images run through the compiled vision encoder (``models/gemma4_mm.py``); a
+    video would reach the tower through upstream's eager path, which the Spyre tower no
+    longer serves. With the limit at 0 the processor never accepts a video and the
+    encoder budgets are sized for images alone.
+    """
+    hf_config = _gemma4_hf_config(engine_args)
+    if hf_config is None or not is_multimodal_gemma4(hf_config):
+        return
+    limits = dict(engine_args.limit_mm_per_prompt or {})
+    video = limits.get("video")
+    count = video.get("count") if isinstance(video, dict) else video
+    if count:
+        raise NotImplementedError(
+            "gemma-4 video input is not supported on Spyre; leave the video limit unset "
+            "or pass --limit-mm-per-prompt '{\"video\": 0}'."
+        )
+    limits.setdefault("video", 0)
+    engine_args.limit_mm_per_prompt = limits
+
+
 def force_text_backbone(engine_args: EngineArgs) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
@@ -117,23 +165,8 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     """
     if engine_args.hf_overrides:
         return
-    from vllm.transformers_utils.config import get_config
-
-    # Detect gemma-4 by config model_type, not the checkpoint name: derivatives such as
-    # medgemma / translategemma carry a gemma4 config under an unrelated name. On any load
-    # failure, defer to ModelConfig, which loads the same config and raises the real error.
-    try:
-        hf_config = get_config(
-            engine_args.hf_config_path or engine_args.model,
-            engine_args.trust_remote_code,
-            engine_args.revision,
-            engine_args.code_revision,
-            engine_args.config_format,
-            token=engine_args.hf_token,
-        )
-    except Exception:
-        return
-    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+    hf_config = _gemma4_hf_config(engine_args)
+    if hf_config is None:
         return
     has_audio = getattr(hf_config, "audio_config", None) is not None
     # A multimodal Gemma4Config reports the same model_type as a text checkpoint.

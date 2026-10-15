@@ -41,10 +41,13 @@ _ADAPTED_MODULES = ("bert", "roberta")
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM builds
-    # its language model through the registry as Gemma4ForCausalLM, which resolves here,
-    # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
+    # The vision checkpoint's language model is built through the registry as
+    # Gemma4ForCausalLM, so both entries apply to it; apply_prelaunch_overrides rewrites a
+    # checkpoint with no vision tower to the backbone alone.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration": (
+        "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
+    ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
@@ -147,4 +150,5 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
 
     register_models()
     gemma4.force_text_backbone(engine_args)
+    gemma4.default_mm_limits(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
