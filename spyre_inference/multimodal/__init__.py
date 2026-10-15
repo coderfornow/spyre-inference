@@ -21,6 +21,7 @@ implementations by layer class. Architectures migrated to a registered subclass 
 """
 
 import torch
+from vllm.model_executor.models.utils import StageMissingLayer
 
 from . import (
     blip2,
@@ -30,6 +31,17 @@ from . import (
     pixtral_hf,
     siglip,
 )
+
+
+def _tower(model: torch.nn.Module, *names: str) -> torch.nn.Module | None:
+    """The first of `names` on `model`; None when absent or stage-skipped (every modality
+    at 0: vLLM's `StageMissingLayer` on meta, forwards attribute reads, raises if called)."""
+    for name in names:
+        tower = getattr(model, name, None)
+        # `is not None` rather than truthiness: an empty container module is falsy.
+        if tower is not None:
+            return None if isinstance(tower, StageMissingLayer) else tower
+    return None
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -44,8 +56,7 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     if isinstance(model, SpyreVisionEncoderMixin):
         return
 
-    # `is not None` rather than `or`: an empty container module is falsy.
-    vision_tower = getattr(model, "vision_tower", None)
+    vision_tower = _tower(model, "vision_tower")
     if vision_tower is not None:
         # Dispatch by tower class name: the `vision_tower` attribute is shared
         # across architectures, so it does not name the model family.
@@ -67,5 +78,8 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     # BLIP-2) also set `vision_model`, and clip.apply() assumes CLIP's specific
     # LayerNorm-based boundary norms.
     hf_config = getattr(model, "config", None)
-    if getattr(hf_config, "model_type", None) == "clip":
+    if (
+        getattr(hf_config, "model_type", None) == "clip"
+        and _tower(model, "vision_model") is not None
+    ):
         clip.apply(model, device)

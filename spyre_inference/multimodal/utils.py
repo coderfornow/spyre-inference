@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import cache
 
 import torch
 import torch.nn as nn
@@ -45,6 +46,32 @@ def pair_swap_matrix(head_dim: int) -> torch.Tensor:
     m[even, even + 1] = 1.0
     m[even + 1, even] = 1.0
     return m
+
+
+@cache
+def rope_perm_matrix(
+    kind: str, head_dim: int, device: torch.device, dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.
+
+    Rotating by a full-width matmul avoids slicing the head: at head_dim=64 a `d/2` slice
+    is 32 wide, which torch-spyre cannot lay out ("Unexpected stick expression ...
+    Mod(var, 32)"), and `cat`ing two slices of a matmul result is silently wrong on
+    device (uncorrelated data, no warning). kind="pair" swaps each `(2k, 2k+1)` pair;
+    kind="half" swaps the two halves, as `rotate_half` does.
+    """
+    m = torch.zeros(head_dim, head_dim, dtype=dtype)
+    if kind == "pair":
+        even = torch.arange(0, head_dim, 2)
+        m[even, even + 1] = 1.0
+        m[even + 1, even] = 1.0
+    elif kind == "half":
+        half = head_dim // 2
+        rows = torch.cat([torch.arange(half, head_dim), torch.arange(0, half)])
+        m[rows, torch.arange(head_dim)] = 1.0
+    else:
+        raise ValueError(f"unknown rope permutation kind {kind!r}")
+    return convert(m, device=device, dtype=dtype)
 
 
 def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
@@ -153,8 +180,9 @@ def padded_sdpa(
     padded, or when the model carries its own scale.
 
     `mask=None` attends everywhere: only the padded keys are masked, and that path
-    is safe inside a compiled block. A float `mask` is additive, as in
-    `F.scaled_dot_product_attention`; one already aligned and on the card is used as is.
+    is safe inside a compiled block. An additive `mask` already padded to `seq_pad`
+    keys, at `q.dtype` and on the card, is used as is: built inside a compiled graph
+    or padded by the caller outside one, where the host round trip cannot run.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -184,10 +212,15 @@ def padded_sdpa(
             if seq == seq_pad
             else _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, q.dtype, device)]
         )
-    elif not padded and mask.device == device and mask.is_floating_point():
-        # Already additive, aligned and on the card, e.g. built inside a compiled graph,
-        # where the host round trip below cannot run.
+    elif mask.shape[-1] == seq_pad and mask.dtype == q.dtype and mask.device == device:
         attn_mask = mask
+    elif mask.shape[-1] == seq_pad and seq != seq_pad:
+        # Padded to seq_pad keys at another dtype or device: `_padded_attn_mask` would
+        # reshape it to [seq, seq] and fail on the size, not the cause.
+        raise TypeError(
+            f"padded_sdpa: a mask padded to {seq_pad} keys has to be {q.dtype} on {device}, "
+            f"got {mask.dtype} on {mask.device}"
+        )
     else:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(

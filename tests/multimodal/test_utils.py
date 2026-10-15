@@ -189,3 +189,13 @@ def test_padded_keys_are_masked_off(seq, seq_pad):
     assert m.shape == (1, 1, seq_pad, seq_pad)
     assert (m[:, :, :, seq:] == torch.finfo(torch.float16).min).all()
     assert (m[:, :, :, :seq] == 0).all()
+
+
+def test_padded_sdpa_refuses_a_padded_mask_at_another_dtype():
+    """A mask already padded to `seq_pad` keys is used as is, so a dtype miss has to say
+    so instead of reaching `_padded_attn_mask`, which would reshape it to `[seq, seq]`."""
+    q, k, v = (torch.randn(2, 2, 50, 64, dtype=torch.float16) for _ in range(3))
+    mask = torch.zeros(2, 1, 1, 64, dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="float32"):
+        padded_sdpa(q, k, v, mask)
