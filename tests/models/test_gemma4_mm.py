@@ -147,7 +147,14 @@ def _reference(config, images) -> list[torch.Tensor]:
 
 def _spyre_model(config, dtype=torch.float16):
     """A ``SpyreGemma4ForConditionalGeneration`` around the same (seeded) upstream
-    modules as ``_reference``, with the steps weight loading performs."""
+    modules as ``_reference``, with the steps weight loading performs.
+
+    Only the linears are cast to ``dtype``, as in the engine: vLLM builds those at the
+    model dtype, while the tower's own norms, position table and standardize buffers are
+    transformers-created fp32 tensors the loader copies into without changing them.
+    """
+    from vllm.model_executor.layers.linear import LinearBase
+
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
 
     model = SpyreGemma4ForConditionalGeneration.__new__(SpyreGemma4ForConditionalGeneration)
@@ -157,11 +164,14 @@ def _spyre_model(config, dtype=torch.float16):
     )
     for name, mod in _upstream_modules(config).items():
         setattr(model, name, mod)
+    for m in model.modules():
+        if isinstance(m, (nn.Linear, LinearBase)):
+            m.to(dtype)
     model._init_spyre_vision()
     # The loader's finish steps, in its order: per-layer first, then the model hook.
     _finish_weight_loading(model)
     model.process_weights_after_loading()
-    return model.to(dtype)
+    return model
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -572,6 +582,35 @@ def test_padded_rms_norm_does_not_promote_via_an_fp32_weight():
     x = torch.randn(1, 4, NUM_HEADS, PADDED_HEAD_DIM, dtype=torch.float16)
     out = _padded_rms_norm(x, torch.randn(PADDED_HEAD_DIM), 1e-6, ORIG_HEAD_DIM)
     assert out.dtype == torch.float16
+
+
+def test_graph_tensors_follow_the_projection_dtype(tp_group):
+    """The position table and the standardize buffers come from transformers in fp32 and
+    the loader keeps them so; promoted into the graph, the first fp16 projection refuses
+    the fp32 activation (seen on the 26B-A4B tower)."""
+    config = _vision_config(num_layers=1)
+    stock = _upstream_modules(config)["vision_tower"]
+    assert stock.encoder.layers[0].input_layernorm.weight.dtype == torch.float32  # premise
+    model = _spyre_model(config)
+    tower = model.vision_tower
+    assert tower.patch_embedder.position_embedding_table.dtype == torch.float32  # untouched
+    layer = tower.encoder.layers[0]
+    for t in (
+        tower.patch_embedder.spyre_pos_x.table,
+        tower.patch_embedder.spyre_pos_y.table,
+        tower.patch_embedder.spyre_patch_weight_t,
+        tower.std_bias,
+        tower.std_scale,
+        model.spyre_cos_x.table,
+        model.spyre_sin_y.table,
+        layer.input_layernorm.weight,
+        layer.post_feedforward_layernorm.weight,
+        layer.self_attn.q_norm.weight,
+    ):
+        assert t.dtype == torch.float16
+    with torch.inference_mode():
+        out = model.embed_multimodal(**_processor_batch(_images(1)))
+    assert out[0].dtype == torch.float16
 
 
 def test_rope_swap_is_a_non_persistent_buffer_at_the_projection_dtype(tp_group):

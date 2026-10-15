@@ -499,9 +499,18 @@ class SpyreGemma4ForConditionalGeneration(  # ty: ignore[invalid-method-override
         weight = _linear_weight(embedder.input_proj)
         weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
         embedder.register_buffer("spyre_patch_weight_t", weight_t, persistent=False)
-        table = _host(embedder.position_embedding_table)
+        # transformers creates its own parameters and buffers in fp32 and the loader keeps
+        # that dtype, so everything the graphs read follows the projections' dtype.
+        dtype = weight.dtype
+        table = _host(embedder.position_embedding_table).to(dtype)
         embedder.spyre_pos_x = GatherTable(table[0].clone())
         embedder.spyre_pos_y = GatherTable(table[1].clone())
+        if tower.config.standardize:
+            tower.std_bias = tower.std_bias.to(dtype)
+            tower.std_scale = tower.std_scale.to(dtype)
+        for module in tower.encoder.modules():
+            if isinstance(module, SpyreGemma4RMSNorm) and module.with_scale:
+                module.weight = nn.Parameter(_host(module.weight).to(dtype), requires_grad=False)
 
     # --- SpyreVisionEncoderMixin hooks ---
 
