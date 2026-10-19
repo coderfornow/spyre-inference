@@ -249,6 +249,9 @@ width (a patch budget, an aspect ratio) has to make that shape enumerable before
 marked. Gemma 4's tower is marked too (`multimodal/gemma4_vision.py`): its rope half-swap
 is a buffer, and its key-pad mask is one row per image built in the encoder forward from
 the image's patch count, since the processor pads an image's patches after its content.
+The encoder forward pads the rows once before the first block (to the stick, or past 2048
+rows to a multiple of 512) and crops them after the last: a pad traced into a block fuses
+into the SDPA scan and reruns per K/V block.
 Every image is padded to the patch count `max_soft_tokens` fixes, so the image-batch widths
 warmup runs are the shapes image serving sees. Not covered: a per-request `max_soft_tokens`
 (vLLM accepts one per prompt), and a video, whose frames reach the tower in memory-sized
