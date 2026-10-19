@@ -23,6 +23,7 @@ The patches are `getattr`-guarded, so a transformers rename would silently no-op
 """
 
 import copy
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -75,7 +76,7 @@ def _vision_config(head_dim: int = ORIG_HEAD_DIM, num_heads: int = NUM_HEADS):
 
 def _position_ids(num_patches: int = NUM_PATCHES) -> torch.Tensor:
     """`[1, num_patches, 2]` (x, y) patch coordinates, as the encoder feeds them."""
-    side = 8
+    side = math.isqrt(num_patches - 1) + 1
     xs = torch.arange(side).repeat(side)[:num_patches]
     ys = torch.arange(side).repeat_interleave(side)[:num_patches]
     return torch.stack([xs, ys], dim=-1).unsqueeze(0)
@@ -967,6 +968,26 @@ def test_layers_stay_the_per_block_compile_unit():
         encoder(embeds, mask, pixel_position_ids=pos)
 
     assert called == list(range(len(encoder.layers)))
+
+
+@pytest.mark.parametrize(("num_patches", "rows"), [(NUM_PATCHES, 64), (2100, 2560)])
+def test_layers_run_on_aligned_rows_and_the_output_keeps_the_patch_count(num_patches, rows):
+    """The blocks see aligned rows, and the output keeps the patch count vLLM reads."""
+    encoder = _encoder()
+    _load(encoder)
+    seen: list[int] = []
+    for layer in encoder.layers:
+        layer.register_forward_pre_hook(lambda _, args: seen.append(args[0].shape[1]))
+
+    embeds, mask, pos = _encoder_inputs(
+        batch=2, num_patches=num_patches, valid=(num_patches - 7, num_patches - 12)
+    )
+    with torch.inference_mode():
+        out = encoder(embeds, mask, pixel_position_ids=pos).last_hidden_state
+
+    assert seen == [rows] * len(encoder.layers)
+    assert out.shape == embeds.shape
+    assert out.is_contiguous()
 
 
 def test_marked_layers_lower_as_fullgraph_blocks_on_spyre():

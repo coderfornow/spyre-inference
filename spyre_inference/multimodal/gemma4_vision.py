@@ -42,6 +42,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_key
 
 logger = init_logger(__name__)
 
+# Rows are padded outside the block graph, where a pad fuses into the SDPA scan and reruns
+# per K/V block. torch-spyre splits K/V only into exact divisors, so long towers go to 512.
+_ROW_ALIGN = 512
+_ROW_ALIGN_FROM = 2048
+
 
 def _host(t: torch.Tensor) -> torch.Tensor:
     """Detach a weight onto the host before reshaping or padding it.
@@ -415,6 +420,9 @@ def patch_vision_encoder() -> None:
     attention over a patch count coprime with the stick. The last two are handled per
     layer by `patch_vision_attention`; this builds the mask and the rope tables on the
     host, once per call rather than once per layer.
+
+    It also pads the rows before the first layer and crops them after the last, so the
+    block graph carries no pad.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -447,13 +455,6 @@ def patch_vision_encoder() -> None:
         device = inputs_embeds.device
         dtype = inputs_embeds.dtype
 
-        inv_freq, attention_scaling = _fp32_inv_freq(self.rotary_emb, config)
-        cos, sin = _gemma4_rope_cos_sin(
-            inv_freq, pixel_position_ids, padded_head_dim, dtype, attention_scaling
-        )
-        cos = convert(cos, device=device)
-        sin = convert(sin, device=device)
-
         # One key-pad row per image, built on the host: the processor pads an image's
         # patches after its content, so a length per image is the whole mask.
         mask_host = convert(attention_mask, device="cpu").bool()
@@ -463,15 +464,29 @@ def patch_vision_encoder() -> None:
             raise NotImplementedError(
                 "Gemma 4 vision on Spyre needs each image's padding after its patches."
             )
-        attn_mask = convert(
-            encoder_key_pad_mask(align_up(seq), valid.tolist(), dtype), device=device
-        )
 
+        rows = align_up(seq, _ROW_ALIGN if seq > _ROW_ALIGN_FROM else STICK)
         hidden_states = inputs_embeds
+        position_ids = convert(pixel_position_ids, device="cpu")
+        if rows != seq:
+            hidden_states = F.pad(inputs_embeds, (0, 0, 0, rows - seq))
+            position_ids = F.pad(position_ids, (0, 0, 0, rows - seq), value=-1)
+
+        inv_freq, attention_scaling = _fp32_inv_freq(self.rotary_emb, config)
+        cos, sin = _gemma4_rope_cos_sin(
+            inv_freq, position_ids, padded_head_dim, dtype, attention_scaling
+        )
+        cos = convert(cos, device=device)
+        sin = convert(sin, device=device)
+        attn_mask = convert(encoder_key_pad_mask(rows, valid.tolist(), dtype), device=device)
+
         for layer in self.layers[: config.num_hidden_layers]:
             hidden_states = layer(
                 hidden_states, position_embeddings=(cos, sin), attention_mask=attn_mask
             )
+        if rows != seq:
+            # vLLM reads each image's token count off the rows it gets back.
+            hidden_states = hidden_states[:, :seq].contiguous()
 
         from transformers.modeling_outputs import BaseModelOutputWithPast
 
