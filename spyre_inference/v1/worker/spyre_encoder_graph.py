@@ -86,6 +86,14 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
+    # Upstream's staticmethod, called on the instance after `self.model` is set.
+    def _generate_budgets(self, min_budget: int, max_budget: int) -> list[int]:  # ty: ignore[invalid-method-override]
+        model = cast("SpyreVisionEncoderMixin", self.model)
+        budgets = model.vision_token_budgets(min_budget, max_budget)
+        if budgets is None:
+            return EncoderCudaGraphManager._generate_budgets(min_budget, max_budget)
+        return budgets
+
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()
     ) -> None:

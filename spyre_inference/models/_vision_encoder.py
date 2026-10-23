@@ -290,6 +290,11 @@ class SpyreVisionEncoderMixin:
         """
         return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
 
+    def vision_token_budgets(self, min_budget: int, max_budget: int) -> list[int] | None:
+        """Token budgets to compile within the range, before alignment; ``None`` keeps upstream's
+        doubling. Override when the processor's item sizes are a small fixed set."""
+        return None
+
     def prepare_encoder_cudagraph_capture_inputs(
         self,
         token_budget: int,

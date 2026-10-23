@@ -125,6 +125,18 @@ def test_user_budgets_below_the_largest_item_fail_at_startup():
         _manager(_FakeVisionModel(max_tokens=300), budgets=[16, 64])
 
 
+def test_model_budget_list_replaces_the_doubling_and_is_aligned():
+    model = _FakeVisionModel(max_tokens=300)
+    model.vision_token_budgets = lambda lo, hi: [20, 100, 300]
+    assert _manager(model).token_budgets == [32, 112, 304]
+
+
+def test_user_budgets_win_over_the_model_budget_list():
+    model = _FakeVisionModel(max_tokens=300)
+    model.vision_token_budgets = lambda lo, hi: [20, 100, 300]
+    assert _manager(model, budgets=[64, 304]).token_budgets == [64, 304]
+
+
 def test_encoder_data_parallel_is_rejected():
     with pytest.raises(NotImplementedError, match="mm_encoder_tp_mode"):
         _manager(_FakeVisionModel(), tp_mode="data")

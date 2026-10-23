@@ -244,6 +244,35 @@ def test_item_tokens_count_valid_patches_only():
     assert model.vision_item_tokens(_mm_kwargs(_images())) == [6, 2]
 
 
+def test_every_supported_max_soft_tokens_has_a_budget():
+    """A request's own ``max_soft_tokens`` lands on a compiled budget, not the eager path."""
+    from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
+
+    model = _spyre_model(_tower_config(num_layers=1))
+    model.max_tokens_per_item = 280  # the engine's default; a request may ask for up to 1120
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            encoder_cudagraph_token_budgets=[],
+            encoder_cudagraph_max_vision_items_per_batch=0,
+            encoder_cudagraph_max_frames_per_batch=None,
+        ),
+        model_config=SimpleNamespace(
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda modality: 0 if modality == "video" else 2,
+                mm_encoder_tp_mode="weights",
+            )
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+    manager = SpyreEncoderGraphManager(vllm_config, torch.device("cpu"), torch.float16, model)
+
+    # Each supported size rounded up to 64 tokens (576 patches); 280 keeps its 320.
+    assert manager.token_budgets == [128, 192, 320, 576, 1152]
+    for tokens in gemma4_mm._SUPPORTED_SOFT_TOKENS:
+        assert manager._path_fitting_budget("default", tokens) is not None
+    assert manager._path_fitting_budget("default", 280) == 320
+
+
 def test_a_grid_the_kernel_does_not_divide_is_rejected():
     model = _spyre_model(_tower_config(num_layers=1))
     with pytest.raises(ValueError, match="pooling kernel"):

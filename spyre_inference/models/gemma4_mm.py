@@ -23,7 +23,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.gemma4 import modeling_gemma4
-from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+from vllm.model_executor.models.gemma4_mm import (
+    _SUPPORTED_SOFT_TOKENS,
+    Gemma4ForConditionalGeneration,
+)
 from vllm.model_executor.models.utils import scatter_output_slices
 
 from spyre_inference.custom_ops.utils import convert
@@ -176,6 +179,15 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
                 "Gemma 4 video input is not supported on Spyre; send the frames as images."
             )
         return super().embed_multimodal(**kwargs)
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
+        """Up to the processor's largest ``max_soft_tokens``: a request may set its own, and
+        ``max_tokens_per_item`` only knows the engine's."""
+        return self.vision_patch_multiple // self.patches_per_token, max(_SUPPORTED_SOFT_TOKENS)
+
+    def vision_token_budgets(self, min_budget: int, max_budget: int) -> list[int]:
+        # One budget per supported size; doubling would put the default 280 on a 512 budget.
+        return [t for t in _SUPPORTED_SOFT_TOKENS if t <= max_budget]
 
     def postprocess_encoder_output(
         self,
