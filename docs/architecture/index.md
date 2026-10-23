@@ -250,9 +250,9 @@ warmup is a shape warmup missed. A tower whose per-image shape varies beyond the
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
 marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
 (`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
-budget, and rejects video. The budgets stop at the largest image the engine's
-`max_soft_tokens` allows, so a request passing a larger `max_soft_tokens` compiles on first
-use: the guard reports it at its default `warn` level and refuses it at `error`.
+budget, and rejects video. It compiles one budget per `max_soft_tokens` the processor
+accepts (70 to 1120, aligned to 128/192/320/576/1152 tokens), not only up to the engine's,
+because a request may set its own (online, behind vLLM's `--trust-request-mm-kwargs`).
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -287,7 +287,7 @@ grows with layer count.
 A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
 class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. The mixin implements
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
-`EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
+`EncoderCudaGraphManager` picks token budgets (powers of two, unless the model lists its own), packs a step's images into them,
 pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
@@ -318,6 +318,7 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_token_budgets(min, max)` | no | budgets to compile, in place of upstream's doubling (default `None`: doubling) | default | one per supported `max_soft_tokens` |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
@@ -338,8 +339,9 @@ Constraints the layout follows:
 
 - The largest budget is the largest item the model's upstream processor can produce
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
-  uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
-  warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+  uses, or the model's `get_encoder_cudagraph_budget_range`; Gemma 4 returns 1120 there,
+  since a request may ask for more than the engine's `max_soft_tokens`), so no item needs a
+  shape warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
 - Patches are **offset-major**: one group per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
