@@ -28,6 +28,7 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
 )
 from vllm.model_executor.models.utils import scatter_output_slices
+from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
@@ -186,8 +187,14 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         return self.vision_patch_multiple // self.patches_per_token, max(_SUPPORTED_SOFT_TOKENS)
 
     def vision_token_budgets(self, min_budget: int, max_budget: int) -> list[int]:
-        # One budget per supported size; doubling would put the default 280 on a 512 budget.
-        return [t for t in _SUPPORTED_SOFT_TOKENS if t <= max_budget]
+        # Upstream's doubling plus each supported size: the processor emits fewer tokens than
+        # max_soft_tokens (a square image 64/121/256/529/1089), so either set alone pads many.
+        doubling = EncoderCudaGraphManager._generate_budgets(min_budget, max_budget)
+        return sorted({*doubling, *(t for t in _SUPPORTED_SOFT_TOKENS if t <= max_budget)})
+
+    @property
+    def vision_pack_tokens(self) -> int:
+        return self.max_tokens_per_item
 
     def postprocess_encoder_output(
         self,

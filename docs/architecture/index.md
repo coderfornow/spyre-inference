@@ -251,7 +251,11 @@ width (a patch budget, an aspect ratio) has to make that shape enumerable before
 marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
 (`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
 budget, and rejects video. It compiles one budget per `max_soft_tokens` the processor
-accepts (70 to 1120, aligned to 128/192/320/576/1152 tokens), not only up to the engine's,
+accepts (70 to 1120) on top of upstream's doubling, 64/128/192/256/320/512/576/1024/1152 tokens
+once aligned, not only up to the engine's: the processor emits fewer tokens than
+`max_soft_tokens` (a square image 64/121/256/529/1089), so either set alone pads many images.
+It also packs several images into one call only up to the engine's own largest image,
+since attention spans the whole packed sequence. This covers every request size
 because a request may set its own (online, behind vLLM's `--trust-request-mm-kwargs`).
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
@@ -318,7 +322,8 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
-| `vision_token_budgets(min, max)` | no | budgets to compile, in place of upstream's doubling (default `None`: doubling) | default | one per supported `max_soft_tokens` |
+| `vision_token_budgets(min, max)` | no | budgets to compile, in place of upstream's doubling (default `None`: doubling) | default | doubling plus one per supported `max_soft_tokens` |
+| `vision_pack_tokens` | no | most tokens one call packs from several items; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used

@@ -266,11 +266,14 @@ def test_every_supported_max_soft_tokens_has_a_budget():
     )
     manager = SpyreEncoderGraphManager(vllm_config, torch.device("cpu"), torch.float16, model)
 
-    # Each supported size rounded up to 64 tokens (576 patches); 280 keeps its 320.
-    assert manager.token_budgets == [128, 192, 320, 576, 1152]
+    # Doubling plus each supported size, rounded up to 64 tokens (576 patches).
+    assert manager.token_budgets == [64, 128, 192, 256, 320, 512, 576, 1024, 1152]
     for tokens in gemma4_mm._SUPPORTED_SOFT_TOKENS:
         assert manager._path_fitting_budget("default", tokens) is not None
-    assert manager._path_fitting_budget("default", 280) == 320
+    # A square image at the default 280 comes out at 256 tokens and pads nothing.
+    assert manager._path_fitting_budget("default", 256) == 256
+    # Several images pack only up to the engine's own largest item.
+    assert model.vision_pack_tokens == 280
 
 
 def test_a_grid_the_kernel_does_not_divide_is_rejected():

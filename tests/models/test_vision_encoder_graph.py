@@ -71,7 +71,11 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return list(mm_kwargs["tokens"])
 
     def select_encoder_cudagraph_items(self, mm_kwargs, indices):
-        return {"tokens": [mm_kwargs["tokens"][i] for i in indices], "ids": indices}
+        ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
+        return {
+            "tokens": [mm_kwargs["tokens"][i] for i in indices],
+            "ids": [ids[i] for i in indices],
+        }
 
     def vision_inputs(self, mm_kwargs):
         ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
@@ -157,6 +161,27 @@ def test_execute_packs_pads_per_block_and_splits_per_item():
     for i, out in enumerate(outputs):
         assert out.device.type == "cpu"
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def test_packing_stops_at_vision_pack_tokens_and_larger_items_run_alone():
+    """Unlimited, upstream packs all three into one 256 budget; at 40 tokens the small two
+    pack into 32 and the large one runs alone."""
+
+    class _Model(_FakeVisionModel):
+        vision_pack_tokens = 40
+
+    model = _Model(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    model.forward_patches.clear()
+
+    outputs = manager.execute({"tokens": [10, 200, 10]})
+
+    assert model.forward_patches == [32 * MERGE_PATCHES, 256 * MERGE_PATCHES]
+    assert [o.shape[0] for o in outputs] == [10, 200, 10]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+    assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
 
 
 def test_unrecorded_budget_is_a_miss():

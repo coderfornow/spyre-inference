@@ -295,6 +295,15 @@ class SpyreVisionEncoderMixin:
         doubling. Override when the processor's item sizes are a small fixed set."""
         return None
 
+    @property
+    def vision_pack_tokens(self) -> int | None:
+        """Most tokens one encoder call packs from several items; a larger item runs alone.
+
+        Attention spans the whole packed sequence, so packing costs ``(sum n)^2`` where separate
+        calls cost ``sum n^2``. Default ``None``: pack up to the largest budget, as upstream.
+        """
+        return None
+
     def prepare_encoder_cudagraph_capture_inputs(
         self,
         token_budget: int,

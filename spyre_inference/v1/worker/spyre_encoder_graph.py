@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import time
+from bisect import bisect_left
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -93,6 +94,36 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         if budgets is None:
             return EncoderCudaGraphManager._generate_budgets(min_budget, max_budget)
         return budgets
+
+    def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        """Upstream's greedy packing, but only up to ``vision_pack_tokens``: smaller items pack
+        into the budgets that cover it, and each larger item runs alone."""
+        pack = cast("SpyreVisionEncoderMixin", self.model).vision_pack_tokens
+        if pack is None:
+            return super()._execute_local(mm_kwargs)
+        tokens = [spec.output_tokens for spec in self._get_item_specs(mm_kwargs)]
+        small = [i for i, t in enumerate(tokens) if t <= pack]
+        groups = [(small, True)] if small else []
+        groups += [([i], False) for i, t in enumerate(tokens) if t > pack]
+        budgets, max_batch = self.path_token_budgets, self.max_batch_size
+        outputs: dict[int, torch.Tensor] = {}
+        try:
+            for indices, packed in groups:
+                if packed:
+                    self.path_token_budgets = {
+                        path: bs[: bisect_left(bs, pack) + 1] for path, bs in budgets.items()
+                    }
+                    self.max_batch_size = max_batch
+                else:
+                    self.path_token_budgets, self.max_batch_size = budgets, 1
+                if len(indices) < len(tokens):
+                    group_kwargs = self._select_items(mm_kwargs, indices)[0]
+                else:
+                    group_kwargs = mm_kwargs
+                outputs.update(zip(indices, super()._execute_local(group_kwargs), strict=True))
+        finally:
+            self.path_token_budgets, self.max_batch_size = budgets, max_batch
+        return [outputs[i] for i in range(len(tokens))]
 
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()
