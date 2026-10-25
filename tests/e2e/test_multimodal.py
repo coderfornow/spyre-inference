@@ -80,32 +80,39 @@ def _conversation(*uris: str):
     ]
 
 
-def _generate(
-    conversations,
+def _llm(
     enforce_eager: bool,
+    max_num_seqs: int = 1,
     images_per_prompt: int = 1,
     model: str = MODEL,
     config_format: str = "mistral",
     dtype: str = "float16",
     revision: str | None = None,
+    max_model_len: int = MAX_MODEL_LEN,
 ):
-    from vllm import LLM, SamplingParams
+    from vllm import LLM
 
-    llm = LLM(
+    return LLM(
         model=model,
         revision=revision,
         tokenizer_revision=revision,
         # Explicit, not `auto`: auto's mistral probe is a live Hub call, so the
         # offline CI runner silently loads the unpatched HF tower instead.
         config_format=config_format,
-        max_model_len=MAX_MODEL_LEN,
-        max_num_seqs=len(conversations),
-        # One decoding sequence, and a prefill of the whole prompt.
-        compilation_config={"compile_sizes": [1, MAX_MODEL_LEN]},
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        # One decoding sequence, and a prefill chunk of the whole prompt up to the platform's 512.
+        compilation_config={"compile_sizes": [1, min(max_model_len, 512)]},
         dtype=dtype,
         enforce_eager=enforce_eager,
         limit_mm_per_prompt={"image": images_per_prompt},
     )
+
+
+def _generate(conversations, enforce_eager: bool, **llm_kwargs):
+    from vllm import SamplingParams
+
+    llm = _llm(enforce_eager, max_num_seqs=len(conversations), **llm_kwargs)
     outputs = llm.chat(
         conversations,
         SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0),
@@ -193,19 +200,7 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs,
     not just run eagerly.
     """
-    if spyre_device_count() == 0:
-        pytest.skip("Spyre device not available")
-
-    # The 26B weights are prefetched only by the perf job, which never runs on a PR, so
-    # the shared cache can legitimately not have them yet.
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
-
-    try:
-        snapshot_download(GEMMA4_MODEL, revision=GEMMA4_REVISION, local_files_only=True)
-    except LocalEntryNotFoundError:
-        pytest.skip(f"{GEMMA4_MODEL}@{GEMMA4_REVISION[:7]} not in the local HF cache")
-
+    _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     # A tower compile at request time is a missed warmup shape: fail, don't log.
     if not enforce_eager:
@@ -221,6 +216,50 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     )
 
     assert text.strip(), "empty generation from the Gemma 4 vision path"
+
+
+@pytest.mark.multimodal
+@pytest.mark.gemma4_vision
+@pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
+def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
+    """Every ``max_soft_tokens`` a request may set lands on a budget compiled at warmup: one
+    that missed would compile mid-request, which the error guard turns into a failure."""
+    _skip_without_gemma4()
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    from vllm import SamplingParams
+    from vllm.model_executor.models.gemma4_mm import _SUPPORTED_SOFT_TOKENS
+
+    llm = _llm(
+        enforce_eager=False,
+        model=GEMMA4_MODEL,
+        config_format="hf",
+        revision=GEMMA4_REVISION,
+        max_model_len=2048,  # room for the 1120-token image
+    )
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
+    for seed, tokens in enumerate(_SUPPORTED_SOFT_TOKENS):
+        (output,) = llm.chat(
+            [_conversation(_synthetic_image_data_uri(seed=seed))],
+            params,
+            mm_processor_kwargs={"max_soft_tokens": tokens},
+        )
+        assert output.outputs[0].text.strip(), f"empty generation at max_soft_tokens={tokens}"
+
+
+def _skip_without_gemma4() -> None:
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+    # The 26B weights are prefetched only by the perf job, which never runs on a PR, so
+    # the shared cache can legitimately not have them yet.
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        snapshot_download(GEMMA4_MODEL, revision=GEMMA4_REVISION, local_files_only=True)
+    except LocalEntryNotFoundError:
+        pytest.skip(f"{GEMMA4_MODEL}@{GEMMA4_REVISION[:7]} not in the local HF cache")
 
 
 if __name__ == "__main__":
