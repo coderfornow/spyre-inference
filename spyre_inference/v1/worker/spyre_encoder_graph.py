@@ -84,7 +84,45 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             self.max_frames_per_batch = min(
                 self.max_frames_per_batch, cap * self.config.max_frames_per_video
             )
+        self._pack_tokens = model.vision_pack_tokens
+        self._pack_budgets: dict[str, list[int]] = {}
+        if self._pack_tokens is not None:
+            for path, budgets in self.path_token_budgets.items():
+                fit = self._path_fitting_budget(path, self._pack_tokens)
+                self._pack_budgets[path] = (
+                    budgets if fit is None else [b for b in budgets if b <= fit]
+                )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+
+    # Upstream's staticmethod, called on the instance after `self.model` is set.
+    def _generate_budgets(self, min_budget: int, max_budget: int) -> list[int]:
+        larger = cast("SpyreVisionEncoderMixin", self.model).vision_token_budgets
+        doubling = EncoderCudaGraphManager._generate_budgets(min_budget, max_budget)
+        return doubling + sorted(t for t in larger if t > max_budget)
+
+    def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
+        pack = self._pack_tokens
+        if pack is None:
+            return super()._execute_local(mm_kwargs)
+        tokens = self._get_per_item_out_tokens(mm_kwargs)
+        small = [i for i, t in enumerate(tokens) if t <= pack]
+        groups = [small] if small else []
+        groups += [[i] for i, t in enumerate(tokens) if t > pack]
+        budgets = self.path_token_budgets
+        outputs: dict[int, torch.Tensor] = {}
+        for indices in groups:
+            if len(indices) == len(tokens):
+                group = mm_kwargs
+            else:
+                group = self._select_items(mm_kwargs, indices)[0]
+            # A lone item keeps every budget; only the packed group is capped.
+            self.path_token_budgets = self._pack_budgets if indices is small else budgets
+            try:
+                outputs.update(zip(indices, super()._execute_local(group), strict=True))
+            finally:
+                self.path_token_budgets = budgets
+        return [outputs[i] for i in range(len(tokens))]
 
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()
