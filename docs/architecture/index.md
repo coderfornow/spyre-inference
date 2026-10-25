@@ -250,9 +250,11 @@ warmup is a shape warmup missed. A tower whose per-image shape varies beyond the
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
 marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
 (`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
-budget, and rejects video. The budgets stop at the largest image the engine's
-`max_soft_tokens` allows, so a request passing a larger `max_soft_tokens` compiles on first
-use: the guard reports it at its default `warn` level and refuses it at `error`.
+budget, and rejects video. Upstream's doubling covers the engine's `max_soft_tokens`, and
+one more budget covers each larger size the processor accepts (up to 1120). Several images
+pack into one call only up to the budget covering the engine's own largest image, since
+attention spans the whole packed sequence; a larger image runs alone at its own budget. A
+request sets its own size online only behind vLLM's `--trust-request-mm-kwargs`.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -287,8 +289,8 @@ grows with layer count.
 A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
 class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. The mixin implements
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
-`EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
-pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
+`EncoderCudaGraphManager` picks power-of-two token budgets (plus any larger ones the model
+lists), packs a step's images into them, pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
@@ -318,6 +320,8 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_token_budgets` | no | budgets above the largest item, for larger items a request may ask for; each runs alone | none | each supported `max_soft_tokens` above the engine's |
+| `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
@@ -336,10 +340,11 @@ placeholders and `embed_input_ids` are inherited unchanged.
 
 Constraints the layout follows:
 
-- The largest budget is the largest item the model's upstream processor can produce
+- The doubling's largest budget is the largest item the model's upstream processor can produce
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
   uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
-  warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+  warmup skipped; `vision_token_budgets` adds budgets above it for larger items a request
+  may ask for. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
 - Patches are **offset-major**: one group per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
