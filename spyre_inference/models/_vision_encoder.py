@@ -290,6 +290,17 @@ class SpyreVisionEncoderMixin:
         """
         return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
 
+    @property
+    def vision_token_budgets(self) -> tuple[int, ...]:
+        """Budgets above the range's largest item, for larger sizes a request may ask for."""
+        return ()
+
+    @property
+    def vision_pack_tokens(self) -> int | None:
+        """Most tokens one call packs from several items, since attention spans the packed
+        sequence; a larger item runs alone. ``None`` packs as upstream does."""
+        return None
+
     def prepare_encoder_cudagraph_capture_inputs(
         self,
         token_budget: int,
