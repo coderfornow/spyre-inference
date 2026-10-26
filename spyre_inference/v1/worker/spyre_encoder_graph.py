@@ -60,6 +60,17 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
+        # Larger sizes a request may ask for join every path, up to the first that holds
+        # max_model_len: an item past that cannot be scheduled.
+        if not vllm_config.compilation_config.encoder_cudagraph_token_budgets:
+            larger: list[int] = []
+            for t in sorted(model.vision_token_budgets):
+                top = larger[-1] if larger else self.token_budgets[-1]
+                if t > top and top < vllm_config.model_config.max_model_len:
+                    larger.append(t)
+            self.token_budgets += larger
+            for budgets in self.path_token_budgets.values():
+                budgets += larger
         # Round every budget up so its patch count is a whole vision_patch_multiple.
         step = model.vision_patch_multiple // model.patches_per_token
 
@@ -93,12 +104,6 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                     budgets if fit is None else [b for b in budgets if b <= fit]
                 )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
-
-    # Upstream's staticmethod, called on the instance after `self.model` is set.
-    def _generate_budgets(self, min_budget: int, max_budget: int) -> list[int]:
-        larger = cast("SpyreVisionEncoderMixin", self.model).vision_token_budgets
-        doubling = EncoderCudaGraphManager._generate_budgets(min_budget, max_budget)
-        return doubling + sorted(t for t in larger if t > max_budget)
 
     def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
         """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""

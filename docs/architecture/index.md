@@ -251,7 +251,8 @@ width (a patch budget, an aspect ratio) has to make that shape enumerable before
 marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
 (`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
 budget, and rejects video. Upstream's doubling covers the engine's `max_soft_tokens`, and
-one more budget covers each larger size the processor accepts (up to 1120). Several images
+one more budget covers each larger size the processor accepts (up to 1120, or the first
+that holds `max_model_len`). Several images
 pack into one call only up to the budget covering the engine's own largest image, since
 attention spans the whole packed sequence; a larger image runs alone at its own budget. A
 request sets its own size online only behind vLLM's `--trust-request-mm-kwargs`.
@@ -344,7 +345,7 @@ Constraints the layout follows:
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
   uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
   warmup skipped; `vision_token_budgets` adds budgets above it for larger items a request
-  may ask for. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+  may ask for, up to the first that holds `max_model_len`. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
 - Patches are **offset-major**: one group per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
