@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.gemma4 import modeling_gemma4
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
@@ -369,6 +370,37 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     attn._spyre_padded_head_dim = padded_head_dim
 
 
+class _ReducedLinear(nn.Linear):
+    """One rank's input columns of a linear; the partial outputs are summed over the TP group."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return tensor_model_parallel_all_reduce(super().forward(input))
+
+
+def _shard_linear(layer, rank: int, world: int, dim: int) -> nn.Linear:
+    """This rank's share of a linear's output rows (``dim=0``) or input columns (``dim=1``)."""
+    linear = _as_plain_linear(layer)
+    if linear.bias is not None:
+        raise NotImplementedError("Gemma 4 vision tensor parallelism needs bias-free linears.")
+    weight = _host(linear.weight)
+    size = weight.shape[dim] // world
+    shard = weight.narrow(dim, rank * size, size).contiguous()
+    cls = nn.Linear if dim == 0 else _ReducedLinear
+    out = cls(shard.shape[1], shard.shape[0], bias=False)
+    out.weight = nn.Parameter(shard, requires_grad=False)
+    return out.to(linear.weight.device)
+
+
+def shard_vision_attention(attn, rank: int, world: int) -> None:
+    """Split one padded attention layer over the TP group by heads; ``o_proj`` all-reduces.
+
+    The MLP stays replicated: a second all-reduce per layer costs more than its split saves.
+    """
+    for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
+        proj.linear = _shard_linear(proj.linear, rank, world, dim=0)
+    attn.o_proj.linear = _shard_linear(attn.o_proj.linear, rank, world, dim=1)
+
+
 _NOT_PADDED = (
     "Gemma 4 vision weights are not padded for this head dim; `pad_vision_weights` runs "
     "from `apply()` at load time and has to precede the first forward."
@@ -400,20 +432,20 @@ class SpyreGemma4VisionAttention(modeling_gemma4.Gemma4VisionAttention):
         del position_ids, kwargs
         cos, sin = position_embeddings
         bsz, seq_len, _ = hidden_states.shape
-        num_heads = self.config.num_attention_heads
         orig_head_dim = self.head_dim
         padded_head_dim = _padded_head_dim(orig_head_dim)
         if getattr(self, "_spyre_padded_head_dim", None) != padded_head_dim:
             raise RuntimeError(_NOT_PADDED)
 
-        # Rope at [B, L, H, D], then transpose to [B, H, L, D] for SDPA.
-        q = self.q_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
+        # Rope at [B, L, H, D], then transpose to [B, H, L, D] for SDPA. H is this rank's
+        # heads once `shard_vision_attention` has split them.
+        q = self.q_proj(hidden_states).view(bsz, seq_len, -1, padded_head_dim)
         q = _padded_rms_norm(q, self.q_norm.weight, self.q_norm.eps, orig_head_dim)
         q = rope_rotate_matmul(q, cos, sin, self.spyre_rope_swap).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, -1, padded_head_dim)
         k = _padded_rms_norm(k, self.k_norm.weight, self.k_norm.eps, orig_head_dim)
         k = rope_rotate_matmul(k, cos, sin, self.spyre_rope_swap).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, -1, padded_head_dim)
         v = _padded_rms_norm(v, None, self.v_norm.eps, orig_head_dim).transpose(1, 2)
 
         attn_out = padded_sdpa(q, k, v, attention_mask, scale=float(self.scaling))

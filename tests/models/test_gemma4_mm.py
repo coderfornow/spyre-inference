@@ -277,6 +277,35 @@ def test_every_supported_max_soft_tokens_has_a_budget():
     assert manager._pack_budgets == {"default": [64, 128, 256, 320]}
 
 
+def test_tp_shards_sum_to_the_unsharded_attention(monkeypatch):
+    """Each rank's heads, summed as the all-reduce sums them, give the layer's attention."""
+    import copy
+
+    from spyre_inference.multimodal import gemma4_vision
+
+    monkeypatch.setattr(gemma4_vision, "tensor_model_parallel_all_reduce", lambda x: x)
+    model = _spyre_model(_tower_config(num_layers=1), torch.float32)
+    attn = model.vision_tower.encoder.layers[0].self_attn
+    x = torch.randn(1, 64, HIDDEN)
+    rope = (torch.ones(1, 64, 1, PADDED_HEAD_DIM), torch.zeros(1, 64, 1, PADDED_HEAD_DIM))
+    shards = [copy.deepcopy(attn) for _ in range(2)]
+    for rank, shard in enumerate(shards):
+        gemma4_vision.shard_vision_attention(shard, rank, 2)
+    assert shards[0].q_proj.linear.out_features == NUM_HEADS // 2 * PADDED_HEAD_DIM
+
+    out = sum(s(x, rope, None)[0] for s in shards)
+    torch.testing.assert_close(out, attn(x, rope, None)[0], rtol=1e-4, atol=1e-4)
+
+
+def test_the_tower_attention_is_split_over_the_tp_group(monkeypatch):
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+
+    monkeypatch.setattr(SpyreGemma4ForConditionalGeneration, "_tp_rank_world", (1, 2))
+    layer = _spyre_model(_tower_config(num_layers=1)).vision_tower.encoder.layers[0]
+    assert layer.self_attn.o_proj.linear.in_features == NUM_HEADS // 2 * PADDED_HEAD_DIM
+    assert layer.mlp.gate_proj.linear.out_features == 256  # replicated, 200 padded to the stick
+
+
 def test_a_grid_the_kernel_does_not_divide_is_rejected():
     model = _spyre_model(_tower_config(num_layers=1))
     with pytest.raises(ValueError, match="pooling kernel"):
