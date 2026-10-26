@@ -60,6 +60,17 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
+        # Larger sizes a request may ask for join every path, up to the first that holds
+        # max_model_len: an item past that cannot be scheduled.
+        if not vllm_config.compilation_config.encoder_cudagraph_token_budgets:
+            larger: list[int] = []
+            for t in sorted(model.vision_token_budgets):
+                top = larger[-1] if larger else self.token_budgets[-1]
+                if t > top and top < vllm_config.model_config.max_model_len:
+                    larger.append(t)
+            self.token_budgets += larger
+            for budgets in self.path_token_budgets.values():
+                budgets += larger
         # Round every budget up so its patch count is a whole vision_patch_multiple.
         step = model.vision_patch_multiple // model.patches_per_token
 
@@ -84,7 +95,39 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             self.max_frames_per_batch = min(
                 self.max_frames_per_batch, cap * self.config.max_frames_per_video
             )
+        self._pack_tokens = model.vision_pack_tokens
+        self._pack_budgets: dict[str, list[int]] = {}
+        if self._pack_tokens is not None:
+            for path, budgets in self.path_token_budgets.items():
+                fit = self._path_fitting_budget(path, self._pack_tokens)
+                self._pack_budgets[path] = (
+                    budgets if fit is None else [b for b in budgets if b <= fit]
+                )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+
+    def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
+        pack = self._pack_tokens
+        if pack is None:
+            return super()._execute_local(mm_kwargs)
+        tokens = self._get_per_item_out_tokens(mm_kwargs)
+        small = [i for i, t in enumerate(tokens) if t <= pack]
+        groups = [small] if small else []
+        groups += [[i] for i, t in enumerate(tokens) if t > pack]
+        budgets = self.path_token_budgets
+        outputs: dict[int, torch.Tensor] = {}
+        for indices in groups:
+            if len(indices) == len(tokens):
+                group = mm_kwargs
+            else:
+                group = self._select_items(mm_kwargs, indices)[0]
+            # A lone item keeps every budget; only the packed group is capped.
+            self.path_token_budgets = self._pack_budgets if indices is small else budgets
+            try:
+                outputs.update(zip(indices, super()._execute_local(group), strict=True))
+            finally:
+                self.path_token_budgets = budgets
+        return [outputs[i] for i in range(len(tokens))]
 
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()
