@@ -224,20 +224,48 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 @pytest.mark.timeout(3600)
 def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     """Every ``max_soft_tokens`` a request may set lands on a budget compiled at warmup: one
-    that missed would compile mid-request, which the error guard turns into a failure."""
+    that missed would compile mid-request, which the error guard turns into a failure.
+
+    Then a default-size and a 1120-size image from two requests share one encoder call, where
+    the large one runs alone and the small one packs; the hit counts show every item replayed
+    a budget.
+    """
     _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    # collective_rpc ships the probes below to the engine process with cloudpickle.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # An image is encoded with its request's prefill, and by default one request prefills
+    # at a time, so two requests' images only meet in one encoder call with a second slot.
+    monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "2")
     from vllm import SamplingParams
     from vllm.model_executor.models.gemma4_mm import _SUPPORTED_SOFT_TOKENS
 
+    def record_encoder_calls(worker):
+        manager = worker.model_runner.encoder_cudagraph_manager
+        manager.calls = []
+        execute = manager._execute_local
+
+        def recording(mm_kwargs):
+            manager.calls.append(manager._get_per_item_out_tokens(mm_kwargs))
+            return execute(mm_kwargs)
+
+        manager._execute_local = recording
+        return manager.graph_hits, manager.graph_misses
+
+    def encoder_calls(worker):
+        manager = worker.model_runner.encoder_cudagraph_manager
+        return manager.calls, manager._pack_tokens, manager.graph_hits, manager.graph_misses
+
     llm = _llm(
         enforce_eager=False,
+        max_num_seqs=2,
         model=GEMMA4_MODEL,
         config_format="hf",
         revision=GEMMA4_REVISION,
         max_model_len=2048,  # room for the 1120-token image
     )
+    ((hits, misses),) = llm.collective_rpc(record_encoder_calls)
     params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
     for seed, tokens in enumerate(_SUPPORTED_SOFT_TOKENS):
         (output,) = llm.chat(
@@ -246,6 +274,23 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
             mm_processor_kwargs={"max_soft_tokens": tokens},
         )
         assert output.outputs[0].text.strip(), f"empty generation at max_soft_tokens={tokens}"
+
+    # Paused, so both requests are queued before the step that encodes them is scheduled.
+    llm.sleep(level=0)
+    mixed = (None, {"max_soft_tokens": max(_SUPPORTED_SOFT_TOKENS)})
+    for seed, kwargs in enumerate(mixed, start=len(_SUPPORTED_SOFT_TOKENS)):
+        llm.enqueue_chat(
+            [_conversation(_synthetic_image_data_uri(seed=seed))],
+            params,
+            mm_processor_kwargs=kwargs,
+        )
+    llm.wake_up(tags=["scheduling"])
+    for output in llm.wait_for_completion():
+        assert output.outputs[0].text.strip(), "empty generation from the mixed batch"
+
+    ((calls, pack, *counts),) = llm.collective_rpc(encoder_calls)
+    assert any(len(c) == 2 and min(c) <= pack < max(c) for c in calls), calls
+    assert counts == [hits + len(_SUPPORTED_SOFT_TOKENS) + 2, misses]
 
 
 def _skip_without_gemma4() -> None:
