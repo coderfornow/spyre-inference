@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.gemma4 import modeling_gemma4
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.models.gemma4_mm import (
     _SUPPORTED_SOFT_TOKENS,
     Gemma4ForConditionalGeneration,
@@ -52,6 +53,7 @@ from spyre_inference.multimodal.gemma4_vision import (
     _padded_head_dim,
     _prepare_attention,
     gemma4_rope_tables,
+    shard_vision_attention,
 )
 from spyre_inference.multimodal.utils import align_up
 
@@ -89,6 +91,8 @@ def _valid_patches(
 
 class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForConditionalGeneration):
     vision_max_items_per_call = SEGMENT_ITEMS
+    # (rank, TP size), set in __init__; a model built without a TP group keeps the tower whole.
+    _tp_rank_world = (0, 1)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         # Transformers builds the tower at vision_config.dtype (bf16), and bf16 + fp16 in a graph
@@ -96,6 +100,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         model_config = vllm_config.model_config
         model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._tp_rank_world = (
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+        )
         self._init_spyre_vision()
 
     def _init_spyre_vision(self) -> None:
@@ -137,9 +145,13 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             return
         config = tower.config
         padded = _padded_head_dim(config.head_dim)
+        rank, world = self._tp_rank_world
+        shard = world > 1 and config.num_attention_heads % world == 0
         for layer in tower.encoder.layers[: config.num_hidden_layers]:
             _prepare_attention(layer.self_attn, config.num_attention_heads, config.head_dim, padded)
             _pad_mlp(layer, config.intermediate_size, align_up(config.intermediate_size))
+            if shard:
+                shard_vision_attention(layer.self_attn, rank, world)
 
         embedder = tower.patch_embedder
         weight = _linear_weight(embedder.input_proj).float()

@@ -360,6 +360,11 @@ Constraints the layout follows:
   at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
   runs on the host anyway.
 - Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
+- Upstream builds Gemma 4's tower replicated, so under TP every rank would run all of it.
+  `shard_vision_attention` gives each rank its share of the heads instead, with `o_proj`
+  all-reducing the partial outputs; the MLP stays replicated, since a second all-reduce per
+  layer cost more than its split saved. The tower stays whole when the heads do not divide
+  by the TP size.
 
 ## Attention Backend
 
