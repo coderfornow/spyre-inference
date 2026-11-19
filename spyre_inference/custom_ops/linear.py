@@ -89,6 +89,24 @@ def spyre_linear_t(
     return out
 
 
+def _upload_transposed(w: torch.Tensor) -> torch.Tensor:
+    """Upload host `[out, in]` as the device tensor its transposed copy uploads to.
+
+    Sticks along the output dim put the elements on the device in the order of the
+    contiguous `[in, out]` copy, so relabelling the upload saves the host transpose."""
+    from torch_spyre import _C
+    from torch_spyre.model_utils import _dma_to_spyre_dim_order_swapped
+
+    rows, cols = w.shape
+    return _C.reinterpret_tensor_with_layout(
+        _dma_to_spyre_dim_order_swapped(w),
+        (cols, rows),
+        (rows, 1),
+        0,
+        _C.SpyreTensorLayout([cols, rows], w.dtype),
+    )
+
+
 class SpyreTransposedWeightMethod:
     """Shared Spyre weight handler: store `Wᵀ` (optionally row-padded) and matmul it.
 
@@ -108,36 +126,40 @@ class SpyreTransposedWeightMethod:
     ROW_ALIGN: int | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # SpyreModelLoader processes a layer as soon as its weights have arrived.
+        if layer.__dict__.pop("_spyre_weights_processed", False):
+            return
         super().process_weights_after_loading(layer)
         self.build_weight_t(layer, cast(torch.Tensor, layer.weight).data)
 
     def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
         """Pad and transpose `w` into `WEIGHT_T_ATTR`. `w` need not be `layer.weight`:
         a tied lm-head builds from a host copy, after the device move."""
-        # SpyreModelLoader streams weights in [in, out] order, so the transpose is free.
-        if w.device.type == "spyre" and self.ROW_ALIGN is None:
-            layer.spyre_row_padding = 0
-            setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
-            return
-
-        padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
-        layer.spyre_row_padding = padding
-        if padding:
-            padded = F.pad(w, (0, 0, 0, padding))
-            logger.warning_once(
-                "%s: weights padded from %d to %d (torch-spyre limitation) "
-                "expect numerical differences to upstream vLLM.",
-                layer.__class__.__name__,
-                w.shape[0],
-                padded.shape[0],
-            )
-            w = padded
-
         # Store transposed (`[in, out]`, contiguous) so the forward GEMM is the
         # Spyre-fast `x @ A`. The transpose is a copy unless `w.t()` is already
         # contiguous (a single row, or a transposed view). Loaded weights never are,
         # so a distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
-        setattr(layer, self.WEIGHT_T_ATTR, Parameter(_transpose_contiguous(w), requires_grad=False))
+        w = self._pad_rows(layer, w)
+        if layer.__dict__.pop("_spyre_upload_weight_t", False):
+            w_t = _upload_transposed(w)
+        else:
+            w_t = _transpose_contiguous(w)
+        setattr(layer, self.WEIGHT_T_ATTR, Parameter(w_t, requires_grad=False))
+
+    def _pad_rows(self, layer: torch.nn.Module, w: torch.Tensor) -> torch.Tensor:
+        padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
+        layer.spyre_row_padding = padding
+        if not padding:
+            return w
+        padded = F.pad(w, (0, 0, 0, padding))
+        logger.warning_once(
+            "%s: weights padded from %d to %d (torch-spyre limitation) "
+            "expect numerical differences to upstream vLLM.",
+            layer.__class__.__name__,
+            w.shape[0],
+            padded.shape[0],
+        )
+        return padded
 
     def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
         return False
@@ -182,6 +204,9 @@ class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
         return self._pads(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # SpyreModelLoader processes a layer as soon as its weights have arrived.
+        if layer.__dict__.pop("_spyre_weights_processed", False):
+            return
         super().process_weights_after_loading(layer)
         if self._pads(layer):
             logger.warning_once(

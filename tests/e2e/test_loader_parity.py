@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Loader parity: the direct-to-device loader and the stock loader agree on greedy output."""
+"""Loader parity: the spyre loader and the stock loader agree on greedy output."""
 
 from types import SimpleNamespace
 
@@ -106,7 +106,7 @@ def _generate(load_format: str, tp_size: int):
 def _check_loader_parity(tp_size: int) -> None:
     """``auto`` (resolved to the spyre loader) and ``safetensors`` give the same greedy output."""
     resolved, spyre = _generate("auto", tp_size)
-    assert resolved == "spyre", "the default load format should resolve to the direct loader"
+    assert resolved == "spyre", "the default load format should resolve to the spyre loader"
     resolved, stock = _generate("safetensors", tp_size)
     assert resolved == "safetensors"
 
@@ -127,8 +127,7 @@ def test_spyre_loader_matches_stock_loader_tp1() -> None:
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 def test_spyre_loader_matches_stock_loader_tp2() -> None:
-    """At TP=2 the spyre loader shards linear weights on read (``_iter_tp_sharded_weights``);
-    the stock loader narrows on the host. Needs two cards."""
+    """Needs two cards."""
     _check_loader_parity(tp_size=2)
 
 

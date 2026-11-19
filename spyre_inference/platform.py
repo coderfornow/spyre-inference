@@ -167,14 +167,8 @@ def _hf_config_has_moe(text_config) -> bool:
 def _padding_active(vllm_config) -> bool:
     """True when head_dim / intermediate_size padding was applied to the text config.
 
-    Padded models stay on the stock loader: the pad passes wrap
-    ``get_all_weights`` and need full, unsharded, host-resident tensors,
-    which the direct-to-device path does not provide:
-      - TP=1: it yields Spyre-resident tensors, so the pad runs as eager Spyre copies
-        that the backend cannot lower ("no offset-free alternative stick dim for
-        mutation target").
-      - TP>1: shard-on-read slices the tensor before the pad wrapper sees it, so the
-        wrapper's width checks no longer match and the TP narrowing then fails.
+    Padded models stay on the stock loader: the pad passes wrap ``get_all_weights``
+    and have not been validated with SpyreModelLoader's upload-as-you-load.
     """
     model_config = getattr(vllm_config, "model_config", None)
     text_cfg = getattr(model_config, "hf_text_config", None)
@@ -195,19 +189,16 @@ def _spyre_loader_supported(vllm_config) -> bool:
         excluded; their host-residency needs are not yet covered (torch-spyre#2971).
       - quantized: FP8 and other quant schemes have their own weight layout logic.
       - transformers backend: uses a different model class hierarchy.
-      - padded head_dim / intermediate_size: the pad passes need the
-        full tensor on the host, but the direct path yields Spyre-resident (TP1)
-        or pre-sharded (TP>1) tensors. Those configs stay on the stock loader.
-      - MoE: dma_moe_expert_weight_to_spyre requires a CPU source tensor.
+      - padded head_dim / intermediate_size: not validated with this loader.
+      - MoE: expert weights are prepared and uploaded by their own path after load.
       - speculative decoding: the draft model is loaded with the target's load_config,
         and drafters such as XPress run host-side ops in load_weights that expect
         host tensors.
 
     Supported, and worth knowing about when touching the loader:
-      - TP > 1: linear weights are sharded on read (see
-        ``model_loader._iter_tp_sharded_weights``).
-      - multimodal: the language backbone streams direct-to-device; vision-tower and
-        projector parameters stay host-loaded (see ``_get_host_loaded_param_names``).
+      - TP > 1: vLLM's weight loaders shard on the host, as on the stock loader.
+      - multimodal: the language backbone's linears upload as they load; vision-tower
+        and projector parameters stay host-loaded (see ``_get_host_loaded_param_names``).
     """
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None:

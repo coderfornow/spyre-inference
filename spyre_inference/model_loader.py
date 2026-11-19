@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SpyreModelLoader — direct-to-device weight loader for IBM Spyre."""
+"""SpyreModelLoader — uploads weights to Spyre while the checkpoint is still loading."""
 
 from __future__ import annotations
 
 import copy
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 import torch
@@ -41,7 +42,7 @@ logger = init_logger(__name__)
 
 @register_model_loader("spyre")
 class SpyreModelLoader(BaseModelLoader):
-    """Streams weights directly from safetensors to Spyre device memory."""
+    """Loads on the host a window of layers at a time, uploading each finished linear."""
 
     def download_model(self, model_config: ModelConfig) -> None:
         from vllm.model_executor.model_loader.weight_utils import (
@@ -58,73 +59,55 @@ class SpyreModelLoader(BaseModelLoader):
     def get_all_weights(
         self, model_config: ModelConfig, model: nn.Module
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Yield (name, tensor) pairs from checkpoint shards using physical disk order.
-
-        Tensors destined for Spyre are loaded via safe_open(device="spyre"),
-        which triggers _SpyreSafeOpen to stream each tensor with optimal Spyre layout.
-        CPU-fallback parameters remain on CPU via safe_open(device="cpu").
-
-        With tensor parallelism (tp_size > 1) linear weights are sharded on read:
-        only this rank's slice is fetched via ``get_slice`` and DMA'd to the device,
-        because vLLM's weight loaders cannot narrow a tensor that already lives on
-        the device in Spyre's stick layout.
-        """
+        """Yield (name, host tensor) pairs from the checkpoint shards in file order."""
         from safetensors import safe_open
-        from vllm.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
 
-        target_dtype = getattr(model_config, "dtype", torch.float16)
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        cpu_fallback_names = _get_host_loaded_param_names(model)
         _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
-
-        for shard_path in shard_files:
-            with safe_open(
-                shard_path,
-                framework="pt",
-                device="spyre",
-                target_dtype=target_dtype,  # ty: ignore[unknown-argument]
-            ) as f_spyre:
-                ordered_keys = f_spyre.offset_keys()
-                cpu_keys = {
-                    k for k in ordered_keys if _param_name_for(model, k) in cpu_fallback_names
-                }
-                f_cpu = None
-                if cpu_keys or tp_size > 1:
-                    f_cpu = safe_open(shard_path, framework="pt", device="cpu")
-
-                try:
-                    if tp_size > 1:
-                        yield from _iter_tp_sharded_weights(
-                            model, f_spyre, f_cpu, ordered_keys, cpu_keys, tp_size, tp_rank
-                        )
-                    else:
-                        for name in ordered_keys:
-                            if name in cpu_keys and f_cpu is not None:
-                                tensor = f_cpu.get_tensor(name)
-                            else:
-                                tensor = f_spyre.get_tensor(name)
-                            yield name, tensor
-                finally:
-                    if f_cpu is not None:
-                        f_cpu.__exit__(None, None, None)
+        for path in shard_files:
+            f = safe_open(path, framework="pt", device="cpu")
+            mapped = 0
+            try:
+                for name in _shard_keys(f):
+                    tensor = f.get_tensor(name)
+                    mapped += tensor.numel() * tensor.element_size()
+                    yield name, tensor
+                    del tensor
+                    if mapped >= _REMAP_BYTES:
+                        # Reopen, so the file pages mapped so far leave this process.
+                        mapped = 0
+                        f.__exit__(None, None, None)
+                        f = safe_open(path, framework="pt", device="cpu")
+            finally:
+                f.__exit__(None, None, None)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        """Stream checkpoint weights directly to Spyre device and CPU fallback modules."""
+        """Load through the model's weight loaders, uploading linears as they fill.
+
+        The model's own weight loaders fuse and shard on the host. ``_UploadStager``
+        uploads each linear layer as soon as it has been filled, so only a window of
+        layers is resident on the host at a time.
+        """
         if hasattr(torch, "spyre") and hasattr(torch.spyre, "is_initialized"):
             assert torch.spyre.is_initialized(), (
                 "SpyreModelLoader called before torch_spyre initialization. "
                 "Ensure TorchSpyreWorker.init_device() runs first."
             )
+        from safetensors import safe_open
 
-        # Delegate to model.load_weights() so fused parameters are scattered
-        # by each layer's weight_loader.
-        loaded_weights = model.load_weights(  # ty: ignore[call-non-callable,union-attr]
-            self.get_all_weights(model_config, model)
-        )
+        _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
+        keys = []
+        for path in shard_files:
+            with safe_open(path, framework="pt", device="cpu") as f:
+                keys += _shard_keys(f)
+        stager = _UploadStager(model, keys)
+        try:
+            loaded_weights = model.load_weights(  # ty: ignore[call-non-callable,union-attr]
+                self.get_all_weights(model_config, model)
+            )
+        except BaseException:
+            stager.close(failed=True)
+            raise
+        stager.close()
         logger.info("SpyreModelLoader: delegated weight loading to model.load_weights()")
         _check_all_weights_loaded(model, loaded_weights)
 
@@ -157,39 +140,23 @@ class SpyreModelLoader(BaseModelLoader):
                 prefix=prefix,
             )
 
-            # Swap non-host CPU parameters for uninitialized Spyre tensors before loading.
-            host_names = _get_host_loaded_param_names(model)
-            for module_name, module in model.named_modules():
-                for param_name, param in list(module._parameters.items()):
-                    if param is None:
-                        continue
-                    full_name = f"{module_name}.{param_name}" if module_name else param_name
-                    if full_name in host_names:
-                        continue
-                    spyre_param = torch.Tensor._make_subclass(
-                        type(param),
-                        torch.empty(param.shape, dtype=param.dtype, device="spyre"),
-                        param.requires_grad,
-                    )
-                    spyre_param.__dict__.update(param.__dict__)
-                    module._parameters[param_name] = spyre_param
-
             self.load_weights(model, model_config)
             process_weights_after_loading(model, model_config, torch.device("cpu"))
+            for module in model.modules():
+                module.__dict__.pop("_spyre_weights_processed", None)
 
         return model.eval()
 
 
 def _get_host_loaded_param_names(model: nn.Module) -> set[str]:
-    """Parameters that must stay on CPU rather than be swapped for an empty Spyre placeholder.
+    """Parameters whose layers are never uploaded during the load.
 
-    - VocabParallelEmbedding weights are placed by the module's own ``_apply`` after
-      ``model.to(spyre)``; a direct Spyre-to-Spyre copy of a vocab-sized table exceeds
-      the per-core limit, so they must arrive from the host.
+    - VocabParallelEmbedding weights are placed by the module's own ``_apply`` in
+      ``model.to(spyre)``.
     - Everything outside a multimodal model's language backbone (vision tower,
       projector). Their ``process_weights_after_loading`` hooks run eager ops on the
       weight (e.g. Pixtral pads the patch embedding) and expect a host tensor, as under
-      the stock loader. They are small, so keeping them on the host costs little.
+      the stock loader.
 
     Pooling heads are not listed: pooling runners are excluded at the platform gate
     (torch-spyre#2971).
@@ -234,11 +201,8 @@ def _param_name_for(model: nn.Module, key: str) -> str:
 def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None) -> None:
     """Fail if a parameter received no checkpoint tensor, as DefaultModelLoader does.
 
-    ``load_model`` swaps every non-host parameter for an uninitialized
-    ``torch.empty(..., device="spyre")`` placeholder, so a parameter the checkpoint never
-    fills (renamed key, WeightsMapper miss, skipped prefix) would otherwise serve garbage
-    silently. ``loaded_weights`` is what ``model.load_weights()`` returned; a model that
-    does not track it (None) cannot be checked.
+    ``loaded_weights`` is what ``model.load_weights()`` returned; a model that does not
+    track it (None) cannot be checked.
     """
     if loaded_weights is None:
         logger.warning(
@@ -255,11 +219,12 @@ def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None)
         )
 
 
-# ---------------------------------------------------------------------------
-# Tensor-parallel shard-on-read helpers (tp_size > 1)
-# ---------------------------------------------------------------------------
+_REMAP_BYTES = 256 << 20
 
-_REPLICATED = "replicated"  # tensor is identical on every rank: load it whole
+
+def _shard_keys(f) -> list[str]:
+    """A shard's keys in file order where safetensors can tell, so reads are sequential."""
+    return list(getattr(f, "offset_keys", f.keys)())
 
 
 def _get_submodule(model: nn.Module, path: str) -> nn.Module | None:
@@ -269,120 +234,151 @@ def _get_submodule(model: nn.Module, path: str) -> nn.Module | None:
         return None
 
 
-def _resolve_module(model: nn.Module, ckpt_name: str) -> tuple[nn.Module | None, str | None]:
-    """Map a checkpoint ``*.weight`` key to (module, packed shard name).
+class _UploadStager:
+    """Uploads each transposed-weight linear once the checkpoint has filled it.
 
-    Fused layers (q/k/v -> qkv_proj, gate/up -> gate_up_proj) are resolved through
-    the model's ``packed_modules_mapping``. The second element is the original
-    shard name (e.g. ``"q_proj"``) when the key belongs to a fused layer, and None when
-    the key already names the layer itself, i.e. the checkpoint stores the fused tensor
-    (Phi-3 maps ``qkv_proj`` to ``["qkv_proj"]``).
+    Every checkpoint key that loads into such a linear is counted up front, and the
+    layer's parameters get a ``weight_loader`` that counts the loads down. At zero the
+    weight is transposed on the host, exactly as the stock path does after loading, and
+    the layer is handed to an upload thread while loading carries on. Loading waits
+    whenever more than ``SPYRE_LOAD_WINDOW_MB`` of weights are queued or in flight, which
+    bounds the host copy. Counting loads rather than keys read keeps this correct for a
+    model that collects the whole iterator before loading.
+
+    A layer whose count never reaches zero, and everything that is not such a linear,
+    stays on the host for vLLM's post-load pass and the runner's ``move_model_to_spyre``.
     """
-    if not ckpt_name.endswith(".weight"):
-        return None, None
-    path = ckpt_name[: -len(".weight")]
-    for packed, shards in getattr(model, "packed_modules_mapping", {}).items():
-        for shard in shards:
-            if path.endswith(f".{shard}"):
-                return _get_submodule(model, path[: -len(shard)] + packed), (
-                    None if shard == packed else shard
-                )
-    return _get_submodule(model, path), None
 
+    def __init__(self, model: nn.Module, keys: list[str]) -> None:
+        from vllm.model_executor.layers.linear import LinearBase
 
-def _shard_plan(model: nn.Module, ckpt_name: str, shape, tp_size: int, tp_rank: int):
-    """Decide how this rank should read ``ckpt_name``.
+        from spyre_inference.custom_ops.linear import SpyreTransposedWeightMethod
 
-    Returns ``(param, dim, start, size)`` for a tensor that can be sharded on read,
-    ``_REPLICATED`` for a tensor every rank loads whole, or ``None`` when we cannot
-    pre-shard it safely (caller falls back to the host path).
-    """
-    from vllm.model_executor.layers.linear import (
-        ColumnParallelLinear,
-        MergedColumnParallelLinear,
-        QKVParallelLinear,
-        RowParallelLinear,
-    )
+        self.window = int(os.environ.get("SPYRE_LOAD_WINDOW_MB", "1024")) << 20
+        self._left: dict[int, int] = {}
+        self._hooks: dict[int, list[tuple[nn.Parameter, bool, object]]] = {}
+        self._pool: ThreadPoolExecutor | None = None
+        self._in_flight: dict[Future, int] = {}
+        host_names = _get_host_loaded_param_names(model)
+        for key in keys:
+            name = _param_name_for(model, key)
+            module_name, _, param_name = name.rpartition(".")
+            module = _get_submodule(model, module_name)
+            method = getattr(module, "quant_method", None)
+            if not (
+                isinstance(module, LinearBase)
+                and isinstance(method, SpyreTransposedWeightMethod)
+                and method.WEIGHT_T_ATTR == "weight"
+                and not any(f"{module_name}.{n}" in host_names for n in module._parameters)
+            ):
+                continue
+            param = module._parameters.get(param_name)
+            if param is None:
+                continue
+            if id(module) not in self._left:
+                self._left[id(module)] = 0
+                self._hooks[id(module)] = []
+            self._left[id(module)] += 1
+            if not any(p is param for p, _, _ in self._hooks[id(module)]):
+                self._hook(module, param)
 
-    module, shard = _resolve_module(model, ckpt_name)
-    if module is None:
-        return None
-    param = getattr(module, "weight", None)
+    def _hook(self, module: nn.Module, param: nn.Parameter) -> None:
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-    if isinstance(module, QKVParallelLinear):
-        if shard is None:  # checkpoint already stores a fused qkv tensor
-            return None
-        head_size = module.head_size
-        if shard.startswith("q"):
-            size, index = module.num_heads * head_size, tp_rank
-        else:  # k / v: kv heads may be replicated across ranks
-            size = module.num_kv_heads * head_size
-            index = tp_rank // module.num_kv_head_replicas
-        return param, 0, index * size, size
-    if isinstance(module, MergedColumnParallelLinear) and shard is None:
-        # A fused [gate; up] checkpoint tensor: one contiguous shape[0] // tp_size block
-        # is not this rank's share of each half. Take the host path.
-        return None
-    if isinstance(module, (MergedColumnParallelLinear, ColumnParallelLinear)):
-        size = shape[0] // tp_size
-        return param, 0, tp_rank * size, size
-    if isinstance(module, RowParallelLinear):
-        size = shape[1] // tp_size
-        return param, 1, tp_rank * size, size
-    if not hasattr(module, "tp_size") and not hasattr(module, "tp_rank"):
-        return _REPLICATED  # norms etc.
-    return None
+        had_loader = hasattr(param, "weight_loader")
+        load = getattr(param, "weight_loader", default_weight_loader)
 
+        def weight_loader(p, *args, **kwargs):
+            load(p, *args, **kwargs)
+            self._loaded(module)
 
-def _iter_tp_sharded_weights(
-    model: nn.Module,
-    f_spyre,
-    f_cpu,
-    ordered_keys: list[str],
-    cpu_keys: set[str],
-    tp_size: int,
-    tp_rank: int,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield checkpoint tensors for TP>1, reading only this rank's shard.
+        param.weight_loader = weight_loader  # ty: ignore[unresolved-attribute]
+        self._hooks[id(module)].append((param, had_loader, load))
 
-    ``f_spyre.get_slice(name)[...]`` reads the slice on the host and DMAs just that
-    shard with Spyre's optimal layout. vLLM's parameter loaders then narrow the
-    tensor by ``param.tp_rank * shard_size``; we set ``param.tp_rank = 0`` for the
-    duration of that single call so the narrow spans the whole (already sharded)
-    tensor, the same full-range narrow that works at TP=1.
+    def _unhook(self, module: nn.Module, stale: nn.Parameter | None = None) -> None:
+        for param, had_loader, load in self._hooks.pop(id(module), ()):
+            if param is stale:
+                param.weight_loader = _refuse_late_load  # ty: ignore[unresolved-attribute]
+            elif had_loader:
+                param.weight_loader = load  # ty: ignore[unresolved-attribute]
+            else:
+                del param.weight_loader  # ty: ignore[unresolved-attribute]
+        self._left.pop(id(module), None)
 
-    Anything we cannot pre-shard safely is yielded from the host handle; the stock
-    loader narrows it on the CPU and the copy into the Spyre param is host->device.
-    """
-    from vllm.model_executor.parameter import BasevLLMParameter
+    def _loaded(self, module: nn.Module) -> None:
+        self._left[id(module)] -= 1
+        if self._left[id(module)]:
+            return
+        # build_weight_t replaces `weight`; a later load into the old one would be lost.
+        self._unhook(module, stale=module._parameters["weight"])
+        if self._pool is None:
+            from torch_spyre.model_utils import _start_upload_thread, _upload_thread_count
 
-    for name in ordered_keys:
-        if name in cpu_keys:
-            yield name, f_cpu.get_tensor(name)
-            continue
+            # The same threads and per-thread streams as load_model_to_spyre's own pool.
+            self._pool = ThreadPoolExecutor(
+                max_workers=_upload_thread_count(None),
+                thread_name_prefix="spyre-load",
+                initializer=_start_upload_thread,
+                initargs=(torch.spyre.current_device(),),  # ty: ignore[unresolved-attribute]
+            )
+        size = sum(p.numel() * p.element_size() for p in module.parameters())
+        self._wait(self.window - size)
+        self._in_flight[self._pool.submit(_process_and_upload, module)] = size
 
-        shape = f_cpu.get_slice(name).get_shape()
-        plan = _shard_plan(model, _hf_to_vllm_name(model, name), shape, tp_size, tp_rank)
+    def _wait(self, limit: int) -> None:
+        """Block until at most ``limit`` bytes are in flight; raise an upload's error."""
+        while self._in_flight:
+            done = [f for f in self._in_flight if f.done()]
+            if not done and sum(self._in_flight.values()) > limit:
+                done = wait(self._in_flight, return_when=FIRST_COMPLETED).done
+            if not done:
+                return
+            for future in done:
+                del self._in_flight[future]
+                future.result()
 
-        if plan is _REPLICATED:
-            yield name, f_spyre.get_tensor(name)
-            continue
-        if plan is None or not isinstance(plan[0], BasevLLMParameter):
-            yield name, f_cpu.get_tensor(name)
-            continue
+    def close(self, failed: bool = False) -> None:
+        """Finish the uploads and drop the hooks of the layers that never filled.
 
-        param, dim, start, size = plan
-        index = [slice(None)] * len(shape)
-        index[dim] = slice(start, start + size)
-        tensor = f_spyre.get_slice(name)[tuple(index)]
-
-        saved_rank = param.tp_rank
-        param.tp_rank = 0
+        After a failed load the queued uploads are cancelled and their errors dropped,
+        so the load's own error is the one raised.
+        """
         try:
-            # The consumer applies weight_loader before asking for the next item.
-            yield name, tensor
+            if not failed:
+                self._wait(-1)
         finally:
-            param.tp_rank = saved_rank
+            self._in_flight.clear()
+            if self._pool is not None:
+                self._pool.shutdown(cancel_futures=True)
+                self._pool = None
+            for hooks in list(self._hooks.values()):
+                for param, had_loader, load in hooks:
+                    if had_loader:
+                        param.weight_loader = load  # ty: ignore[unresolved-attribute]
+                    else:
+                        del param.weight_loader  # ty: ignore[unresolved-attribute]
+            self._hooks.clear()
+            self._left.clear()
+
+
+def _process_and_upload(module: nn.Module) -> None:
+    from torch_spyre.model_utils import load_model_to_spyre
+
+    # Read once each by SpyreTransposedWeightMethod: the weight goes to the device as it
+    # is transposed, and vLLM's pass over the whole model does not process it again.
+    module._spyre_upload_weight_t = True  # ty: ignore[unresolved-attribute]
+    module.quant_method.process_weights_after_loading(module)  # ty: ignore[call-non-callable,unresolved-attribute]
+    module._spyre_weights_processed = True  # ty: ignore[unresolved-attribute]
+    if hasattr(module, "update_param_tp_status"):
+        module.update_param_tp_status()  # ty: ignore[call-non-callable]
+    load_model_to_spyre(module, num_threads=1)
+
+
+def _refuse_late_load(param, *args, **kwargs):
+    raise RuntimeError(
+        "SpyreModelLoader: a checkpoint tensor arrived for a linear layer after the layer "
+        "was uploaded; use --load-format safetensors for this model."
+    )
 
 
 def _has_safetensors_checkpoint(model_config: ModelConfig, load_config) -> bool:
