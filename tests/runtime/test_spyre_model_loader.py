@@ -22,20 +22,25 @@ import torch.nn as nn
 from safetensors.torch import save_file
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.config import LoadConfig, ModelConfig, ParallelConfig, VllmConfig
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.utils import WeightsMapper
 
 import spyre_inference.platform as plat_mod
+from spyre_inference.custom_ops.linear import (
+    SpyreMergedColumnParallelLinear,
+    SpyreQKVParallelLinear,
+    SpyreRowParallelLinear,
+    SpyreTransposedWeightMethod,
+    swapped_rows,
+    swapped_weight_layout,
+)
 from spyre_inference.model_loader import (
     SpyreModelLoader,
+    _card_writes_on_threads,
     _check_all_weights_loaded,
     _get_host_loaded_param_names,
-    _hf_to_vllm_name,
-    _param_name_for,
-    _resolve_module,
-    _shard_plan,
+    _placeholder,
+    _resolve_checkpoint_files,
 )
 from spyre_inference.platform import (
     TorchSpyrePlatform,
@@ -347,81 +352,6 @@ def test_load_model_patches_attention_before_building_the_model(monkeypatch):
     assert calls == ["patched", "init"]
 
 
-class _MappedModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-        }
-    )
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-
-
-def test_hf_to_vllm_name_applies_the_mapper():
-    model = _MappedModel()
-    assert (
-        _hf_to_vllm_name(model, "model.language_model.embed_tokens.weight")
-        == "language_model.model.embed_tokens.weight"
-    )
-
-
-def test_hf_to_vllm_name_without_a_mapper_is_a_noop():
-    assert (
-        _hf_to_vllm_name(nn.Linear(2, 2), "model.embed_tokens.weight")
-        == "model.embed_tokens.weight"
-    )
-
-
-def test_mistral_format_keys_are_untouched():
-    """Mistral-format keys are renamed inside the model's own load_weights, not the mapper."""
-    assert _param_name_for(_MappedModel(), "tok_embeddings.weight") == "tok_embeddings.weight"
-
-
-def test_param_name_for_resolves_fused_layers():
-    model = _MappedModel()
-    key = "model.vision_tower.transformer.layers.0.attention.q_proj.weight"
-    assert (
-        _param_name_for(model, key) == "vision_tower.transformer.layers.0.attention.qkv_proj.weight"
-    )
-    key = "model.vision_tower.transformer.layers.0.feed_forward.up_proj.weight"
-    assert (
-        _param_name_for(model, key)
-        == "vision_tower.transformer.layers.0.feed_forward.gate_up_proj.weight"
-    )
-
-
-def test_hf_to_vllm_name_matches_the_real_mistral3_mapper():
-    from vllm.model_executor.models.mistral3 import Mistral3ForConditionalGeneration as M
-
-    model = SimpleNamespace(hf_to_vllm_mapper=M.hf_to_vllm_mapper)
-    assert (
-        _hf_to_vllm_name(model, "model.language_model.embed_tokens.weight")
-        == "language_model.model.embed_tokens.weight"
-    )
-    # The pre-4.52 layout already matches vLLM's names and must pass through unchanged.
-    legacy = "language_model.model.embed_tokens.weight"
-    assert _hf_to_vllm_name(model, legacy) == legacy
-
-
-def test_hf_to_vllm_name_matches_the_real_pixtral_mapper():
-    from vllm.model_executor.models.pixtral import PixtralForConditionalGeneration as P
-
-    model = SimpleNamespace(hf_to_vllm_mapper=P.hf_to_vllm_mapper)
-    assert (
-        _hf_to_vllm_name(model, "model.language_model.embed_tokens.weight")
-        == "language_model.model.embed_tokens.weight"
-    )
-    assert (
-        _hf_to_vllm_name(model, "model.vision_tower.transformer.layers.0.attention.q_proj.weight")
-        == "vision_encoder.transformer.layers.0.attention.q_proj.weight"
-    )
-    legacy = "language_model.model.embed_tokens.weight"
-    assert _hf_to_vllm_name(model, legacy) == legacy
-
-
 def test_spyre_loader_supported_rejects_speculative_decoding():
     """The draft model reuses the target's load_config; drafters need host tensors."""
     ns = _make_ns()
@@ -478,53 +408,6 @@ def test_load_model_does_not_fall_back_when_safetensors_exist(tmp_path, monkeypa
         loader.load_model(SimpleNamespace(), config)
 
 
-_PHI3 = {"qkv_proj": ["qkv_proj"], "gate_up_proj": ["gate_up_proj"]}
-_LLAMA = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"]}
-
-
-def _bare(cls, **attrs):
-    """A layer of ``cls`` without running its __init__ (no TP group or device needed)."""
-    layer = cls.__new__(cls)
-    nn.Module.__init__(layer)
-    layer.weight = nn.Parameter(torch.zeros(1))
-    for name, value in attrs.items():
-        setattr(layer, name, value)
-    return layer
-
-
-def _packed_model(mapping):
-    model = nn.Module()
-    model.packed_modules_mapping = mapping
-    model.self_attn, model.mlp = nn.Module(), nn.Module()
-    model.self_attn.qkv_proj = _bare(
-        QKVParallelLinear, head_size=16, num_heads=2, num_kv_heads=2, num_kv_head_replicas=1
-    )
-    model.mlp.gate_up_proj = _bare(MergedColumnParallelLinear)
-    return model
-
-
-def test_resolve_module_reports_no_shard_for_a_fused_checkpoint_key():
-    model = _packed_model(_PHI3)
-    module, shard = _resolve_module(model, "self_attn.qkv_proj.weight")
-    assert module is model.self_attn.qkv_proj and shard is None
-
-
-@pytest.mark.parametrize("mapping", [_PHI3, _LLAMA, {}], ids=["phi3", "llama", "no-mapping"])
-def test_fused_checkpoint_tensors_take_the_host_path(mapping):
-    """A fused qkv / gate_up checkpoint tensor can't be pre-sharded as one contiguous block."""
-    model = _packed_model(mapping)
-    assert _shard_plan(model, "self_attn.qkv_proj.weight", (192, 64), 2, 1) is None
-    assert _shard_plan(model, "mlp.gate_up_proj.weight", (256, 64), 2, 1) is None
-
-
-def test_unfused_checkpoint_tensors_are_still_sharded_on_read():
-    model = _packed_model(_LLAMA)
-    q = _shard_plan(model, "self_attn.q_proj.weight", (64, 64), 2, 1)
-    k = _shard_plan(model, "self_attn.k_proj.weight", (64, 64), 2, 1)
-    gate = _shard_plan(model, "mlp.gate_proj.weight", (128, 64), 2, 1)
-    assert q[1:] == (0, 32, 32) and k[1:] == (0, 32, 32) and gate[1:] == (0, 64, 64)
-
-
 class _TwoLinearModel(nn.Module):
     """A normal linear layer plus one whose weight must stay on the host."""
 
@@ -541,38 +424,155 @@ class _TwoLinearModel(nn.Module):
         return loaded
 
 
+def _exact(*shape):
+    """Values the card's 16-bit format holds exactly, so a read-back compares with ``equal``."""
+    return torch.randn(*shape).to(torch.bfloat16).to(torch.float16)
+
+
+def _weight_t(layer, parts, *, on_card: bool):
+    """``layer``'s stored ``W^T`` after loading ``parts`` ((shard id or None, tensor) pairs),
+    through the stock host path or through SpyreModelLoader's placeholder and card writes."""
+    if on_card:
+        layer._parameters["weight"] = _placeholder(layer, "weight", layer.weight)
+    with _card_writes_on_threads(4 if on_card else 1):
+        for shard_id, tensor in parts:
+            args = (tensor,) if shard_id is None else (tensor, shard_id)
+            layer.weight_loader(layer.weight, *args)
+    layer.quant_method.process_weights_after_loading(layer)
+    return layer.weight
+
+
+_FUSED_CASES = [
+    pytest.param(
+        lambda: SpyreQKVParallelLinear(256, 64, 4, 2, bias=False, params_dtype=torch.float16),
+        [("q", (256, 256)), ("k", (128, 256)), ("v", (128, 256))],
+        True,
+        id="qkv",
+    ),
+    pytest.param(
+        lambda: SpyreMergedColumnParallelLinear(
+            256, [512, 512], bias=False, params_dtype=torch.float16
+        ),
+        [(0, (512, 256)), (1, (512, 256))],
+        True,
+        id="gate-up",
+    ),
+    pytest.param(
+        lambda: SpyreMergedColumnParallelLinear(
+            256, [100, 220], bias=False, params_dtype=torch.float16
+        ),
+        [(0, (100, 256)), (1, (220, 256))],
+        False,
+        id="gate-up-off-the-stick-grid",
+    ),
+    pytest.param(
+        lambda: SpyreRowParallelLinear(256, 1000, bias=False, params_dtype=torch.float16),
+        [(None, (1000, 256))],
+        True,
+        id="row-parallel",
+    ),
+]
+
+
 @pytest.mark.spyre_device
-def test_loader_places_weights_on_the_right_device(tmp_path, monkeypatch, tp_group):
-    """A normal weight is streamed to Spyre, a host-loaded one stays on the CPU, and both
-    hold the checkpoint's values."""
+@pytest.mark.parametrize(("make", "shards", "swapped"), _FUSED_CASES)
+def test_card_written_weight_equals_the_stock_transpose(make, shards, swapped, tp_group):
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    parts = [(shard_id, _exact(*shape)) for shard_id, shape in shards]
+    stock = _weight_t(make(), parts, on_card=False)
+
+    layer = make()
+    assert (swapped_rows(_placeholder(layer, "weight", layer.weight)) is not None) == swapped
+    direct = _weight_t(layer, parts, on_card=True)
+
+    assert direct.device.type == "spyre"
+    assert swapped_rows(direct) is None
+    assert torch.equal(direct.cpu(), stock)
+
+
+@pytest.mark.spyre_device
+def test_tp_column_shard_is_written_without_a_host_copy(tp_group):
+    """A row-parallel rank's share is a strided view of the mapped checkpoint tensor."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    full = _exact(1024, 512)
+    shard = full[:, 256:]
+    assert not shard.is_contiguous()
+    layer = SpyreRowParallelLinear(256, 1024, bias=False, params_dtype=torch.float16)
+
+    assert torch.equal(_weight_t(layer, [(None, shard)], on_card=True).cpu(), shard.t())
+
+
+@pytest.mark.spyre_device
+def test_row_slice_off_the_stick_grid_is_rejected_on_the_card():
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    from torch_spyre.model_utils import spyre_empty_with_layout
+
+    layout = swapped_weight_layout((320, 256), torch.float16)
+    weight = spyre_empty_with_layout(
+        torch.Size((320, 256)), (256, 1), torch.float16, layout, device=None
+    )
+    with (
+        _card_writes_on_threads(2),
+        pytest.raises(ValueError, match="rows 100:220 .* not aligned"),
+    ):
+        weight.narrow(0, 100, 120).copy_(_exact(120, 256))
+
+
+@pytest.mark.spyre_device
+def test_row_padded_weight_keeps_the_default_layout():
+    """An lm-head pads its rows on the host, so its placeholder is not stick-swapped."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
-    w_dense = torch.randn(64, 64, dtype=torch.float16)
-    w_fallback = torch.randn(64, 64, dtype=torch.float16)
-    ckpt = tmp_path / "model.safetensors"
-    save_file({"dense.weight": w_dense, "fallback.weight": w_fallback}, str(ckpt))
+    class Padded(SpyreTransposedWeightMethod):
+        ROW_ALIGN = 64
 
-    monkeypatch.setattr(
-        "spyre_inference.model_loader._get_host_loaded_param_names",
-        lambda model: {"fallback.weight"},
-    )
+    module = SimpleNamespace(quant_method=Padded())
+    weight = torch.empty(128, 256, dtype=torch.float16)
+    assert swapped_rows(_placeholder(module, "weight", weight)) is None
+
+
+def test_consolidated_checkpoint_is_read_alone(tmp_path):
+    for name in ("consolidated.safetensors", "model-00001-of-00002.safetensors"):
+        (tmp_path / name).write_bytes(b"")
+    config = SimpleNamespace(model=str(tmp_path), revision=None)
+
+    _, files = _resolve_checkpoint_files(config, LoadConfig(load_format="spyre"))
+
+    assert files == [str(tmp_path / "consolidated.safetensors")]
+
+
+@pytest.mark.spyre_device
+@pytest.mark.parametrize("num_threads", [1, 4])
+def test_loader_writes_a_bf16_checkpoint_split_over_two_files(tmp_path, monkeypatch, num_threads):
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    w_dense = torch.randn(128, 64, dtype=torch.bfloat16)
+    w_fallback = torch.randn(64, 64, dtype=torch.bfloat16)
+    files = [
+        tmp_path / "model-00001-of-00002.safetensors",
+        tmp_path / "model-00002-of-00002.safetensors",
+    ]
+    save_file({"dense.weight": w_dense}, str(files[0]))
+    save_file({"fallback.weight": w_fallback}, str(files[1]))
     monkeypatch.setattr(
         "spyre_inference.model_loader._resolve_checkpoint_files",
-        lambda model_config, load_config: (str(tmp_path), [str(ckpt)]),
+        lambda model_config, load_config: (str(tmp_path), [str(f) for f in files]),
     )
 
     model = _TwoLinearModel()
-    # What SpyreModelLoader.load_model does before loading: a Spyre placeholder for every
-    # parameter that is not host-loaded. Creating it also initializes the device.
     model.dense.weight = nn.Parameter(
-        torch.empty(64, 64, dtype=torch.float16, device="spyre"), requires_grad=False
+        torch.empty(128, 64, dtype=torch.float16, device="spyre"), requires_grad=False
     )
-
-    loader = SpyreModelLoader(LoadConfig(load_format="spyre"))
+    loader = SpyreModelLoader(
+        LoadConfig(load_format="spyre", model_loader_extra_config={"num_threads": num_threads})
+    )
     loader.load_weights(model, SimpleNamespace(dtype=torch.float16))
 
+    assert torch.equal(model.dense.weight.cpu(), w_dense.to(torch.float16))
     assert model.dense.weight.device.type == "spyre"
     assert model.fallback.weight.device.type == "cpu"
-    assert torch.allclose(model.dense.weight.cpu(), w_dense, atol=1e-3, rtol=1e-3)
-    assert torch.equal(model.fallback.weight, w_fallback)
+    assert torch.equal(model.fallback.weight, w_fallback.to(torch.float16))

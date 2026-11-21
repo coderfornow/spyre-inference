@@ -16,9 +16,17 @@
 
 from __future__ import annotations
 
+import contextvars
 import copy
+import ctypes
+import functools
+import mmap
 import os
-from collections.abc import Iterable, Iterator
+import sys
+import threading
+from collections.abc import Generator, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,15 +41,229 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from spyre_inference.custom_ops.linear import (
+    SpyreTransposedWeightMethod,
+    swapped_weight_layout,
+    whole_swapped_weight,
+)
+
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
 logger = init_logger(__name__)
 
+_DEFAULT_LOAD_THREADS = 8
+_MAX_LOAD_THREADS = 16
+# Bytes of checkpoint tensors queued or being written at once. The device runtime converts
+# each write on the host first, so this also bounds that staging.
+_MAX_OUTSTANDING_BYTES = 2 << 30
+
+_load_thread = threading.local()
+
+
+def _start_load_thread(device_index: int) -> None:
+    torch.spyre.set_device(device_index)
+    _load_thread.stream = torch.spyre.Stream()
+
+
+def _copy_to_card(dst: torch.Tensor, src: torch.Tensor) -> None:
+    from torch_spyre._C import copy_tensor
+
+    copy_tensor(src, dst, non_blocking=False)
+
+
+def _span(t: torch.Tensor) -> int:
+    """Elements from the first to the last one `t` addresses in its storage."""
+    return sum((n - 1) * st for n, st in zip(t.shape, t.stride())) + 1 if t.numel() else 0
+
+
+class _CardWrites:
+    """The host-to-card weight writes of one load, on threads with a device stream each.
+
+    `submit` returns before the data is on the card; `wait` returns once it all is."""
+
+    def __init__(self, threads: int) -> None:
+        self._pool = (
+            ThreadPoolExecutor(
+                max_workers=threads,
+                thread_name_prefix="spyre-load",
+                initializer=_start_load_thread,
+                initargs=(torch.spyre.current_device(),),
+            )
+            if threads > 1
+            else None
+        )
+        self._cond = threading.Condition()
+        # (storage, first element, last element + 1, source bytes) of each unfinished write.
+        self._pending: list[tuple[int, int, int, int]] = []
+        self._bytes = 0
+        self._error: BaseException | None = None
+        # [start, end) addresses of the open checkpoint file's mappings.
+        self._mapped: list[tuple[int, int]] = []
+
+    def submit(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        if not whole_swapped_weight(dst) and not src.is_contiguous():
+            mapped = src
+            src = src.contiguous()
+            self.release_pages(mapped)
+        if self._pool is None:
+            _copy_to_card(dst, src)
+            self.release_pages(src)
+            return
+
+        first = int(dst.storage_offset())
+        nbytes = src.numel() * src.element_size()
+        entry = (dst.untyped_storage()._cdata, first, first + _span(dst), nbytes)
+        with self._cond:
+            # A second write to the same elements lands after the first. One write is
+            # always admitted, so a tensor above the budget cannot hang.
+            self._cond.wait_for(
+                lambda: (
+                    self._error is not None
+                    or (
+                        not any(
+                            s == entry[0] and lo < entry[2] and first < hi
+                            for s, lo, hi, _ in self._pending
+                        )
+                        and (not self._pending or self._bytes + nbytes <= _MAX_OUTSTANDING_BYTES)
+                    )
+                )
+            )
+            if self._error is not None:
+                raise self._error
+            self._pending.append(entry)
+            self._bytes += nbytes
+        self._pool.submit(self._write, dst, src, entry)
+
+    def _write(
+        self, dst: torch.Tensor, src: torch.Tensor, entry: tuple[int, int, int, int]
+    ) -> None:
+        error = None
+        try:
+            with torch.spyre.stream(_load_thread.stream):
+                _copy_to_card(dst, src)
+            self.release_pages(src)
+        except BaseException as e:
+            error = e
+        with self._cond:
+            self._error = self._error or error
+            self._pending.remove(entry)
+            self._bytes -= entry[3]
+            self._cond.notify_all()
+
+    def wait(self) -> None:
+        with self._cond:
+            self._cond.wait_for(lambda: self._error is not None or not self._pending)
+            if self._error is not None:
+                raise self._error
+
+    def shutdown(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(cancel_futures=True)
+
+    def map_file(self, path: str | None) -> None:
+        """Note where checkpoint file `path` is mapped; None forgets the last file."""
+        self._mapped = []
+        if path is None or sys.platform != "linux":
+            return
+        real = os.path.realpath(path)
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(None, 5)
+                if len(fields) == 6 and fields[5].rstrip("\n") == real:
+                    start, end = fields[0].split("-")
+                    self._mapped.append((int(start, 16), int(end, 16)))
+
+    def release_pages(self, src: torch.Tensor) -> None:
+        """Drop the whole pages `src` covers from this process once they are on the card.
+
+        They stay in the page cache and fault back in if read again, as the file holds
+        them: the mapping is private, so an in-place edit of a source tensor is lost.
+        Only a range inside the checkpoint file's mapping is touched: the same call zeroes
+        heap memory, which is what a big-endian host's byte-swapped tensors live in."""
+        if not self._mapped or not src.numel():
+            return
+        page = mmap.PAGESIZE
+        start = -(-src.data_ptr() // page) * page
+        end = (src.data_ptr() + _span(src) * src.element_size()) // page * page
+        if end > start and any(lo <= start and end <= hi for lo, hi in self._mapped):
+            _libc().madvise(
+                ctypes.c_void_p(start), ctypes.c_size_t(end - start), mmap.MADV_DONTNEED
+            )
+
+
+@functools.cache
+def _libc() -> ctypes.CDLL:
+    return ctypes.CDLL(None)
+
+
+_active_writes: contextvars.ContextVar[_CardWrites | None] = contextvars.ContextVar(
+    "spyre_card_writes", default=None
+)
+_copy_patch = threading.Lock()
+
+
+@contextmanager
+def _card_writes_on_threads(threads: int) -> Iterator[None]:
+    """Run the host-to-card `copy_` calls of the weight loaders inside on `threads` threads.
+
+    vLLM's weight loaders end in `param.data[...].copy_(loaded_weight)`, so `Tensor.copy_`
+    is wrapped while the context is open, for calls from the entering thread only. A load
+    that starts while another holds the wrapper is not wrapped."""
+    if not _copy_patch.acquire(blocking=False):
+        logger.warning("SpyreModelLoader: another load is writing weights; loading serially.")
+        yield
+        return
+    writes = _CardWrites(threads)
+    owner = threading.current_thread()
+    original = torch.Tensor.copy_
+    shadowed = torch.Tensor.__dict__.get("copy_")
+
+    def copy_(dst, src, *args, **kwargs):
+        if (
+            threading.current_thread() is not owner
+            or not isinstance(src, torch.Tensor)
+            or src.device.type != "cpu"
+        ):
+            return original(dst, src, *args, **kwargs)
+        if dst.device.type != "spyre":
+            original(dst, src, *args, **kwargs)
+            writes.release_pages(src)
+            return dst
+        writes.submit(dst, src)
+        return dst
+
+    token = _active_writes.set(writes)
+    torch.Tensor.copy_ = copy_  # ty: ignore[invalid-assignment]
+    try:
+        yield
+        writes.wait()
+    finally:
+        writes.shutdown()
+        if shadowed is None:
+            del torch.Tensor.copy_
+        else:
+            torch.Tensor.copy_ = shadowed
+        _active_writes.reset(token)
+        _copy_patch.release()
+
 
 @register_model_loader("spyre")
 class SpyreModelLoader(BaseModelLoader):
-    """Streams weights directly from safetensors to Spyre device memory."""
+    """Writes weights from safetensors straight to Spyre device memory."""
+
+    def __init__(self, load_config) -> None:
+        super().__init__(load_config)
+        extra_config = load_config.model_loader_extra_config
+        if not isinstance(extra_config, dict) or set(extra_config) - {"num_threads"}:
+            raise ValueError(
+                f"model_loader_extra_config for load format spyre takes only num_threads, "
+                f"got {extra_config!r}"
+            )
+        num_threads = extra_config.get("num_threads")
+        if num_threads is not None and not (isinstance(num_threads, int) and num_threads > 0):
+            raise ValueError(f"num_threads must be a positive integer, got {num_threads!r}")
+        self._num_threads = num_threads
 
     def download_model(self, model_config: ModelConfig) -> None:
         from vllm.model_executor.model_loader.weight_utils import (
@@ -57,60 +279,25 @@ class SpyreModelLoader(BaseModelLoader):
 
     def get_all_weights(
         self, model_config: ModelConfig, model: nn.Module
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Yield (name, tensor) pairs from checkpoint shards using physical disk order.
-
-        Tensors destined for Spyre are loaded via safe_open(device="spyre"),
-        which triggers _SpyreSafeOpen to stream each tensor with optimal Spyre layout.
-        CPU-fallback parameters remain on CPU via safe_open(device="cpu").
-
-        With tensor parallelism (tp_size > 1) linear weights are sharded on read:
-        only this rank's slice is fetched via ``get_slice`` and DMA'd to the device,
-        because vLLM's weight loaders cannot narrow a tensor that already lives on
-        the device in Spyre's stick layout.
-        """
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield (name, memory-mapped tensor) pairs in physical disk order. Inside
+        `_card_writes_on_threads`, each file's writes finish before the next file opens."""
         from safetensors import safe_open
-        from vllm.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
 
-        target_dtype = getattr(model_config, "dtype", torch.float16)
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        cpu_fallback_names = _get_host_loaded_param_names(model)
         _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
-
-        for shard_path in shard_files:
-            with safe_open(
-                shard_path,
-                framework="pt",
-                device="spyre",
-                target_dtype=target_dtype,  # ty: ignore[unknown-argument]
-            ) as f_spyre:
-                ordered_keys = f_spyre.offset_keys()
-                cpu_keys = {
-                    k for k in ordered_keys if _param_name_for(model, k) in cpu_fallback_names
-                }
-                f_cpu = None
-                if cpu_keys or tp_size > 1:
-                    f_cpu = safe_open(shard_path, framework="pt", device="cpu")
-
-                try:
-                    if tp_size > 1:
-                        yield from _iter_tp_sharded_weights(
-                            model, f_spyre, f_cpu, ordered_keys, cpu_keys, tp_size, tp_rank
-                        )
-                    else:
-                        for name in ordered_keys:
-                            if name in cpu_keys and f_cpu is not None:
-                                tensor = f_cpu.get_tensor(name)
-                            else:
-                                tensor = f_spyre.get_tensor(name)
-                            yield name, tensor
-                finally:
-                    if f_cpu is not None:
-                        f_cpu.__exit__(None, None, None)
+        writes = _active_writes.get()
+        for index, shard_path in enumerate(shard_files, 1):
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                if writes is not None:
+                    writes.map_file(shard_path)
+                for name in f.offset_keys():
+                    yield name, f.get_tensor(name)
+                if writes is not None:
+                    writes.wait()
+                    writes.map_file(None)
+            logger.info(
+                "SpyreModelLoader: %d of %d checkpoint files written", index, len(shard_files)
+            )
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Stream checkpoint weights directly to Spyre device and CPU fallback modules."""
@@ -120,12 +307,13 @@ class SpyreModelLoader(BaseModelLoader):
                 "Ensure TorchSpyreWorker.init_device() runs first."
             )
 
-        # Delegate to model.load_weights() so fused parameters are scattered
-        # by each layer's weight_loader.
-        loaded_weights = model.load_weights(  # ty: ignore[call-non-callable,union-attr]
-            self.get_all_weights(model_config, model)
-        )
-        logger.info("SpyreModelLoader: delegated weight loading to model.load_weights()")
+        threads = self._num_threads or min(_DEFAULT_LOAD_THREADS, torch.get_num_threads())
+        weights = self.get_all_weights(model_config, model)
+        try:
+            with _card_writes_on_threads(min(threads, _MAX_LOAD_THREADS)):
+                loaded_weights = model.load_weights(weights)  # ty: ignore[call-non-callable,union-attr]
+        finally:
+            weights.close()
         _check_all_weights_loaded(model, loaded_weights)
 
     def load_model(
@@ -166,18 +354,33 @@ class SpyreModelLoader(BaseModelLoader):
                     full_name = f"{module_name}.{param_name}" if module_name else param_name
                     if full_name in host_names:
                         continue
-                    spyre_param = torch.Tensor._make_subclass(
-                        type(param),
-                        torch.empty(param.shape, dtype=param.dtype, device="spyre"),
-                        param.requires_grad,
-                    )
-                    spyre_param.__dict__.update(param.__dict__)
-                    module._parameters[param_name] = spyre_param
+                    module._parameters[param_name] = _placeholder(module, param_name, param)
 
             self.load_weights(model, model_config)
             process_weights_after_loading(model, model_config, torch.device("cpu"))
 
         return model.eval()
+
+
+def _placeholder(module: nn.Module, param_name: str, param: torch.Tensor) -> torch.Tensor:
+    """An uninitialized device parameter in place of `param`."""
+    method = getattr(module, "quant_method", None)
+    if (
+        param_name == "weight"
+        and isinstance(method, SpyreTransposedWeightMethod)
+        and method.takes_swapped_weight(module, param)
+    ):
+        from torch_spyre.model_utils import spyre_empty_with_layout
+
+        layout = swapped_weight_layout(param.shape, param.dtype)
+        data = spyre_empty_with_layout(
+            param.size(), param.stride(), param.dtype, layout, device=None
+        )
+    else:
+        data = torch.empty(param.shape, dtype=param.dtype, device="spyre")
+    placeholder = torch.Tensor._make_subclass(type(param), data, param.requires_grad)
+    placeholder.__dict__.update(param.__dict__)
+    return placeholder
 
 
 def _get_host_loaded_param_names(model: nn.Module) -> set[str]:
@@ -206,31 +409,6 @@ def _get_host_loaded_param_names(model: nn.Module) -> set[str]:
     return names
 
 
-def _hf_to_vllm_name(model: nn.Module, key: str) -> str:
-    """A checkpoint key after the model's ``hf_to_vllm_mapper`` (a no-op without one).
-
-    ``get_all_weights`` sees raw checkpoint keys, but the mapper runs inside
-    ``model.load_weights``, after the loader has already chosen host or device per key.
-    A key the mapper drops is returned unchanged.
-    """
-    mapper = getattr(model, "hf_to_vllm_mapper", None)
-    if mapper is None:
-        return key
-    mapped = mapper.apply_list([key])
-    return mapped[0] if mapped else key
-
-
-def _param_name_for(model: nn.Module, key: str) -> str:
-    """The vLLM parameter name a checkpoint key loads into: mapper first, then the
-    fused-layer name (``q_proj`` -> ``qkv_proj``) from ``packed_modules_mapping``."""
-    name = _hf_to_vllm_name(model, key)
-    for packed, shards in getattr(model, "packed_modules_mapping", {}).items():
-        for shard in shards:
-            if f".{shard}." in name:
-                return name.replace(f".{shard}.", f".{packed}.", 1)
-    return name
-
-
 def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None) -> None:
     """Fail if a parameter received no checkpoint tensor, as DefaultModelLoader does.
 
@@ -255,136 +433,6 @@ def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None)
         )
 
 
-# ---------------------------------------------------------------------------
-# Tensor-parallel shard-on-read helpers (tp_size > 1)
-# ---------------------------------------------------------------------------
-
-_REPLICATED = "replicated"  # tensor is identical on every rank: load it whole
-
-
-def _get_submodule(model: nn.Module, path: str) -> nn.Module | None:
-    try:
-        return model.get_submodule(path)
-    except AttributeError:
-        return None
-
-
-def _resolve_module(model: nn.Module, ckpt_name: str) -> tuple[nn.Module | None, str | None]:
-    """Map a checkpoint ``*.weight`` key to (module, packed shard name).
-
-    Fused layers (q/k/v -> qkv_proj, gate/up -> gate_up_proj) are resolved through
-    the model's ``packed_modules_mapping``. The second element is the original
-    shard name (e.g. ``"q_proj"``) when the key belongs to a fused layer, and None when
-    the key already names the layer itself, i.e. the checkpoint stores the fused tensor
-    (Phi-3 maps ``qkv_proj`` to ``["qkv_proj"]``).
-    """
-    if not ckpt_name.endswith(".weight"):
-        return None, None
-    path = ckpt_name[: -len(".weight")]
-    for packed, shards in getattr(model, "packed_modules_mapping", {}).items():
-        for shard in shards:
-            if path.endswith(f".{shard}"):
-                return _get_submodule(model, path[: -len(shard)] + packed), (
-                    None if shard == packed else shard
-                )
-    return _get_submodule(model, path), None
-
-
-def _shard_plan(model: nn.Module, ckpt_name: str, shape, tp_size: int, tp_rank: int):
-    """Decide how this rank should read ``ckpt_name``.
-
-    Returns ``(param, dim, start, size)`` for a tensor that can be sharded on read,
-    ``_REPLICATED`` for a tensor every rank loads whole, or ``None`` when we cannot
-    pre-shard it safely (caller falls back to the host path).
-    """
-    from vllm.model_executor.layers.linear import (
-        ColumnParallelLinear,
-        MergedColumnParallelLinear,
-        QKVParallelLinear,
-        RowParallelLinear,
-    )
-
-    module, shard = _resolve_module(model, ckpt_name)
-    if module is None:
-        return None
-    param = getattr(module, "weight", None)
-
-    if isinstance(module, QKVParallelLinear):
-        if shard is None:  # checkpoint already stores a fused qkv tensor
-            return None
-        head_size = module.head_size
-        if shard.startswith("q"):
-            size, index = module.num_heads * head_size, tp_rank
-        else:  # k / v: kv heads may be replicated across ranks
-            size = module.num_kv_heads * head_size
-            index = tp_rank // module.num_kv_head_replicas
-        return param, 0, index * size, size
-    if isinstance(module, MergedColumnParallelLinear) and shard is None:
-        # A fused [gate; up] checkpoint tensor: one contiguous shape[0] // tp_size block
-        # is not this rank's share of each half. Take the host path.
-        return None
-    if isinstance(module, (MergedColumnParallelLinear, ColumnParallelLinear)):
-        size = shape[0] // tp_size
-        return param, 0, tp_rank * size, size
-    if isinstance(module, RowParallelLinear):
-        size = shape[1] // tp_size
-        return param, 1, tp_rank * size, size
-    if not hasattr(module, "tp_size") and not hasattr(module, "tp_rank"):
-        return _REPLICATED  # norms etc.
-    return None
-
-
-def _iter_tp_sharded_weights(
-    model: nn.Module,
-    f_spyre,
-    f_cpu,
-    ordered_keys: list[str],
-    cpu_keys: set[str],
-    tp_size: int,
-    tp_rank: int,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield checkpoint tensors for TP>1, reading only this rank's shard.
-
-    ``f_spyre.get_slice(name)[...]`` reads the slice on the host and DMAs just that
-    shard with Spyre's optimal layout. vLLM's parameter loaders then narrow the
-    tensor by ``param.tp_rank * shard_size``; we set ``param.tp_rank = 0`` for the
-    duration of that single call so the narrow spans the whole (already sharded)
-    tensor, the same full-range narrow that works at TP=1.
-
-    Anything we cannot pre-shard safely is yielded from the host handle; the stock
-    loader narrows it on the CPU and the copy into the Spyre param is host->device.
-    """
-    from vllm.model_executor.parameter import BasevLLMParameter
-
-    for name in ordered_keys:
-        if name in cpu_keys:
-            yield name, f_cpu.get_tensor(name)
-            continue
-
-        shape = f_cpu.get_slice(name).get_shape()
-        plan = _shard_plan(model, _hf_to_vllm_name(model, name), shape, tp_size, tp_rank)
-
-        if plan is _REPLICATED:
-            yield name, f_spyre.get_tensor(name)
-            continue
-        if plan is None or not isinstance(plan[0], BasevLLMParameter):
-            yield name, f_cpu.get_tensor(name)
-            continue
-
-        param, dim, start, size = plan
-        index = [slice(None)] * len(shape)
-        index[dim] = slice(start, start + size)
-        tensor = f_spyre.get_slice(name)[tuple(index)]
-
-        saved_rank = param.tp_rank
-        param.tp_rank = 0
-        try:
-            # The consumer applies weight_loader before asking for the next item.
-            yield name, tensor
-        finally:
-            param.tp_rank = saved_rank
-
-
 def _has_safetensors_checkpoint(model_config: ModelConfig, load_config) -> bool:
     """Whether the checkpoint has safetensors shards (fetched first when remote)."""
     try:
@@ -398,7 +446,11 @@ def _resolve_checkpoint_files(
     model_config: ModelConfig,
     load_config,
 ) -> tuple[str, list[str]]:
-    """Resolve and filter shard file paths for the checkpoint."""
+    """Resolve the checkpoint files the way ``DefaultModelLoader`` does for ``auto``.
+
+    A repo with ``consolidated*.safetensors`` is read from those alone: its HF-named shards hold
+    the same weights again, and vLLM's Mistral models do not map every HF name.
+    """
     import glob as glob_mod
 
     from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -407,21 +459,25 @@ def _resolve_checkpoint_files(
         download_weights_from_hf,
         filter_duplicate_safetensors_files,
     )
+    from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
     model_path = model_config.model
     revision = model_config.revision
     is_local = os.path.isdir(model_path)
+    pattern, index_file = "*.safetensors", SAFE_WEIGHTS_INDEX_NAME
+    if list_filtered_repo_files(model_path, ["consolidated*.safetensors"], revision):
+        pattern, index_file = "consolidated*.safetensors", "consolidated.safetensors.index.json"
 
     if not is_local:
         model_path = download_weights_from_hf(
             model_name_or_path=model_path,
             cache_dir=load_config.download_dir,
-            allow_patterns=["*.safetensors"],
+            allow_patterns=[pattern],
             revision=revision,
             ignore_patterns=load_config.ignore_patterns,
         )
 
-    shard_files = glob_mod.glob(os.path.join(model_path, "*.safetensors"))
+    shard_files = glob_mod.glob(os.path.join(model_path, pattern))
     if not shard_files:
         raise FileNotFoundError(
             f"No safetensors checkpoint shards found in {model_path}. SpyreModelLoader "
@@ -431,12 +487,10 @@ def _resolve_checkpoint_files(
     if not is_local and len(shard_files) > 1:
         download_safetensors_index_file_from_hf(
             model_config.model,
-            SAFE_WEIGHTS_INDEX_NAME,
+            index_file,
             cache_dir=load_config.download_dir,
             revision=revision,
         )
-    shard_files = sorted(
-        filter_duplicate_safetensors_files(shard_files, model_path, SAFE_WEIGHTS_INDEX_NAME)
-    )
+    shard_files = sorted(filter_duplicate_safetensors_files(shard_files, model_path, index_file))
 
     return model_path, shard_files

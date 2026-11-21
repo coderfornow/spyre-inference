@@ -21,7 +21,7 @@ Spyre-fast `x @ Wᵀ` in `apply`. Subclasses parameterize the destination
 attribute and an optional output-row padding (needed by the lm-head).
 """
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn.functional as F
@@ -37,6 +37,9 @@ from vllm.model_executor.layers.linear import (
 )
 
 from spyre_inference import envs
+
+if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
 
 logger = init_logger(__name__)
 
@@ -62,6 +65,63 @@ def _transpose_contiguous(w: torch.Tensor) -> torch.Tensor:
     for i in range(0, w.shape[0], _TRANSPOSE_BLOCK_ROWS):
         out[:, i : i + _TRANSPOSE_BLOCK_ROWS].copy_(w[i : i + _TRANSPOSE_BLOCK_ROWS].t())
     return out
+
+
+def swapped_weight_layout(shape: tuple[int, ...], dtype: torch.dtype) -> "SpyreTensorLayout":
+    """Device layout of an `[out, in]` weight with its sticks along `out`.
+
+    Its bytes sit in the order of the contiguous `[in, out]` transpose, so a weight written
+    into it needs no transpose: `relabel_swapped_weight` reads the same storage as `Wᵀ`."""
+    from torch_spyre._C import SpyreTensorLayout
+
+    out, inn = shape
+    return SpyreTensorLayout([out, inn], [inn, 1], dtype, [1, 0])
+
+
+def swapped_rows(w: torch.Tensor) -> int | None:
+    """Rows, padded to whole sticks, of the stick-swapped device tensor that `w` is or is a
+    row slice of; None when the layout is any other."""
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    if w.dim() != 2:
+        return None
+    actual = get_spyre_tensor_layout(w)
+    rows = actual.device_size[0] * actual.elems_per_stick()
+    expected = swapped_weight_layout((rows, w.shape[1]), w.dtype)
+    if (actual.device_size, actual.stride_map) != (expected.device_size, expected.stride_map):
+        return None
+    return rows
+
+
+def whole_swapped_weight(dst: torch.Tensor) -> bool:
+    """Whether `dst` is a whole stick-swapped weight, the one device destination that reads
+    a strided host source correctly.
+
+    Raises for a row slice of one that is off the stick grid: torch-spyre does not check
+    it, the slice lands shifted and overwrites its neighbours."""
+    rows = swapped_rows(dst)
+    if rows is None:
+        return False
+    from torch_spyre._C import get_elem_in_stick
+
+    stick = get_elem_in_stick(dst.dtype)
+    if not dst.storage_offset() and dst.shape[0] > rows - stick:
+        return True
+    start = dst.storage_offset() // dst.shape[1]
+    if start % stick or dst.shape[0] % stick:
+        raise ValueError(
+            f"rows {start}:{start + dst.shape[0]} of a stick-swapped weight are not "
+            f"aligned to its {stick}-element sticks"
+        )
+    return False
+
+
+def relabel_swapped_weight(w: torch.Tensor) -> torch.Tensor:
+    from torch_spyre import _C
+
+    out, inn = w.shape
+    layout = _C.SpyreTensorLayout([inn, out], w.dtype)
+    return _C.reinterpret_tensor_with_layout(w, (inn, out), (out, 1), 0, layout)
 
 
 def spyre_linear_t(
@@ -107,6 +167,27 @@ class SpyreTransposedWeightMethod:
     WEIGHT_T_ATTR: str = "weight"
     ROW_ALIGN: int | None = None
 
+    def takes_swapped_weight(self, layer: torch.nn.Module, w: torch.Tensor) -> bool:
+        """Whether SpyreModelLoader may allocate `layer.weight` stick-swapped, which
+        `build_weight_t` then only relabels. Every slice a weight loader writes into it
+        must sit on the stick grid."""
+        if self.ROW_ALIGN is not None or self.WEIGHT_T_ATTR != "weight" or w.dim() != 2:
+            return False
+        from torch_spyre._C import get_elem_in_stick
+
+        stick = get_elem_in_stick(w.dtype)
+        parts = getattr(layer, "output_partition_sizes", ())
+        if len(parts) <= 1 or all(size % stick == 0 for size in parts):
+            return True
+        logger.warning(
+            "%s fuses parts of %s rows, not multiples of %d; SpyreModelLoader transposes "
+            "its weight on the device, which compiles.",
+            type(layer).__name__,
+            parts,
+            stick,
+        )
+        return False
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         self.build_weight_t(layer, cast(torch.Tensor, layer.weight).data)
@@ -114,10 +195,12 @@ class SpyreTransposedWeightMethod:
     def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
         """Pad and transpose `w` into `WEIGHT_T_ATTR`. `w` need not be `layer.weight`:
         a tied lm-head builds from a host copy, after the device move."""
-        # SpyreModelLoader streams weights in [in, out] order, so the transpose is free.
         if w.device.type == "spyre" and self.ROW_ALIGN is None:
             layer.spyre_row_padding = 0
-            setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
+            # A stick-swapped weight (SpyreModelLoader's) already holds the transpose's bytes.
+            swapped = swapped_rows(w) is not None
+            w_t = relabel_swapped_weight(w) if swapped else w.t().contiguous()
+            setattr(layer, self.WEIGHT_T_ATTR, Parameter(w_t, requires_grad=False))
             return
 
         padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0

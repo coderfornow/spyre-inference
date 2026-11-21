@@ -350,6 +350,19 @@ different KV scales therefore compiles the transformer block and each recorded a
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.
 
+## Loading weights straight to the device
+
+`--load-format spyre` writes each checkpoint tensor from its memory-mapped safetensors
+file into the device parameter, without building the model on the host first. It is the
+default on POWER hosts and opt-in elsewhere, and covers unquantized dense text and
+multimodal models; other configurations are rejected at startup and load with the stock
+loader.
+
+The writes run on threads, each converting one tensor to the device format on a host
+core. `--model-loader-extra-config '{"num_threads": 4}'` sets how many; the default is
+8, or torch's thread count when that is lower, and the limit is 16. With tensor
+parallelism every rank starts its own threads.
+
 ## Model runner
 
 The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by

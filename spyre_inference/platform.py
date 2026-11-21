@@ -178,14 +178,8 @@ def _hf_config_has_moe(text_config) -> bool:
 def _padding_active(vllm_config) -> bool:
     """True when head_dim / intermediate_size padding was applied to the text config.
 
-    Padded models stay on the stock loader: the pad passes wrap
-    ``get_all_weights`` and need full, unsharded, host-resident tensors,
-    which the direct-to-device path does not provide:
-      - TP=1: it yields Spyre-resident tensors, so the pad runs as eager Spyre copies
-        that the backend cannot lower ("no offset-free alternative stick dim for
-        mutation target").
-      - TP>1: shard-on-read slices the tensor before the pad wrapper sees it, so the
-        wrapper's width checks no longer match and the TP narrowing then fails.
+    Padded models stay on the stock loader: the pad passes wrap ``get_all_weights`` and
+    build a padded host copy of each tensor, which SpyreModelLoader does not handle.
     """
     model_config = getattr(vllm_config, "model_config", None)
     text_cfg = getattr(model_config, "hf_text_config", None)
