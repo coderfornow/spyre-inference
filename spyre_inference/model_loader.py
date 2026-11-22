@@ -20,6 +20,7 @@ import contextvars
 import copy
 import ctypes
 import functools
+import json
 import mmap
 import os
 import sys
@@ -29,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch import nn
 from vllm.logger import init_logger
@@ -197,6 +199,64 @@ def _libc() -> ctypes.CDLL:
     return ctypes.CDLL(None)
 
 
+_SWAPPED_DTYPES = {
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+}
+_SWAPPED_INTS = {2: torch.int16, 4: torch.int32, 8: torch.int64}
+_MIN_SWAP_CHUNK = 1 << 20
+
+
+class _SwappedCheckpoint:
+    """A safetensors file's tensors in host byte order, converted on threads.
+
+    For a big-endian host: safetensors swaps each tensor on the calling thread under the
+    GIL, which is most of a load there. The heap copy is the one it makes too."""
+
+    def __init__(self, path: str, threads: int) -> None:
+        with open(path, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            self._header = json.loads(f.read(header_len))
+            self._map = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        self._base = 8 + header_len
+        self._threads = threads
+        self._pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="spyre-swap")
+
+    def get_tensor(self, name: str) -> torch.Tensor | None:
+        """None for a dtype with nothing to swap; safetensors reads those."""
+        info = self._header[name]
+        dtype = _SWAPPED_DTYPES.get(info["dtype"])
+        start, end = (self._base + offset for offset in info["data_offsets"])
+        if dtype is None or end == start:
+            return None
+        size = dtype.itemsize
+        src = np.frombuffer(self._map, f"<i{size}", (end - start) // size, start)
+        out = torch.empty(src.size, dtype=_SWAPPED_INTS[size])
+        dst = out.numpy()
+        step = max(-(-src.size // self._threads), _MIN_SWAP_CHUNK)
+        list(
+            self._pool.map(
+                lambda i: np.copyto(dst[i : i + step], src[i : i + step]),
+                range(0, src.size, step),
+            )
+        )
+        if sys.platform == "linux":
+            page = mmap.PAGESIZE
+            first = -(-start // page) * page
+            if end // page * page > first:
+                self._map.madvise(mmap.MADV_DONTNEED, first, end // page * page - first)
+        return out.view(dtype).reshape(info["shape"])
+
+    def close(self) -> None:
+        self._pool.shutdown()
+        self._map.close()
+
+
 _active_writes: contextvars.ContextVar[_CardWrites | None] = contextvars.ContextVar(
     "spyre_card_writes", default=None
 )
@@ -265,6 +325,10 @@ class SpyreModelLoader(BaseModelLoader):
             raise ValueError(f"num_threads must be a positive integer, got {num_threads!r}")
         self._num_threads = num_threads
 
+    def _threads(self) -> int:
+        threads = self._num_threads or min(_DEFAULT_LOAD_THREADS, torch.get_num_threads())
+        return min(threads, _MAX_LOAD_THREADS)
+
     def download_model(self, model_config: ModelConfig) -> None:
         from vllm.model_executor.model_loader.weight_utils import (
             download_weights_from_hf,
@@ -287,14 +351,22 @@ class SpyreModelLoader(BaseModelLoader):
         _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
         writes = _active_writes.get()
         for index, shard_path in enumerate(shard_files, 1):
-            with safe_open(shard_path, framework="pt", device="cpu") as f:
-                if writes is not None:
-                    writes.map_file(shard_path)
-                for name in f.offset_keys():
-                    yield name, f.get_tensor(name)
-                if writes is not None:
-                    writes.wait()
-                    writes.map_file(None)
+            swapped = (
+                _SwappedCheckpoint(shard_path, self._threads()) if sys.byteorder == "big" else None
+            )
+            try:
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    if writes is not None:
+                        writes.map_file(shard_path)
+                    for name in f.offset_keys():
+                        tensor = swapped.get_tensor(name) if swapped is not None else None
+                        yield name, f.get_tensor(name) if tensor is None else tensor
+                    if writes is not None:
+                        writes.wait()
+                        writes.map_file(None)
+            finally:
+                if swapped is not None:
+                    swapped.close()
             logger.info(
                 "SpyreModelLoader: %d of %d checkpoint files written", index, len(shard_files)
             )
@@ -307,10 +379,9 @@ class SpyreModelLoader(BaseModelLoader):
                 "Ensure TorchSpyreWorker.init_device() runs first."
             )
 
-        threads = self._num_threads or min(_DEFAULT_LOAD_THREADS, torch.get_num_threads())
         weights = self.get_all_weights(model_config, model)
         try:
-            with _card_writes_on_threads(min(threads, _MAX_LOAD_THREADS)):
+            with _card_writes_on_threads(self._threads()):
                 loaded_weights = model.load_weights(weights)  # ty: ignore[call-non-callable,union-attr]
         finally:
             weights.close()

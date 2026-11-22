@@ -21,6 +21,7 @@ write, ordering, the byte budget, failures and what is left behind. The device t
 
 import contextlib
 import itertools
+import mmap
 import random
 import sys
 import threading
@@ -35,7 +36,12 @@ from vllm.config import LoadConfig
 
 import spyre_inference.custom_ops.linear as linear_module
 import spyre_inference.model_loader as loader_module
-from spyre_inference.model_loader import SpyreModelLoader, _card_writes_on_threads, _CardWrites
+from spyre_inference.model_loader import (
+    SpyreModelLoader,
+    _card_writes_on_threads,
+    _CardWrites,
+    _SwappedCheckpoint,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -269,14 +275,47 @@ def test_pages_are_released_only_inside_the_checkpoint_mapping(tmp_path, monkeyp
         writes.release_pages(expected)
         assert not calls
         writes.release_pages(mapped)
+        if sys.byteorder == "big":
+            # safetensors hands out a byte-swapped heap copy, which must be left alone.
+            assert not calls
+            assert torch.equal(mapped, expected)
+            return
         ((start, length),) = calls
-        assert start % 4096 == 0 and length % 4096 == 0
+        assert start % mmap.PAGESIZE == 0 and length % mmap.PAGESIZE == 0
         assert mapped.data_ptr() <= start and length <= mapped.numel() * 4
         # The pages fault back in from the file.
         assert torch.equal(mapped, expected)
         writes.map_file(None)
         writes.release_pages(mapped)
         assert len(calls) == 1
+
+
+def test_swapped_checkpoint_matches_safetensors(tmp_path, monkeypatch):
+    monkeypatch.setattr(loader_module, "_MIN_SWAP_CHUNK", 64)
+    tensors = {
+        "bf16": torch.randn(33, 65).to(torch.bfloat16),
+        "f16": torch.randn(7, 129).to(torch.float16),
+        "f32": torch.randn(1000),
+        "i64": torch.arange(-500, 500),
+        "scalar": torch.tensor(3.5),
+        "empty": torch.empty(0, 4),
+        "u8": torch.arange(200, dtype=torch.uint8),
+    }
+    path = tmp_path / "model.safetensors"
+    save_file(tensors, str(path))
+    swapped = _SwappedCheckpoint(str(path), 4)
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            for name, expected in tensors.items():
+                got = swapped.get_tensor(name)
+                if name in ("empty", "u8"):
+                    assert got is None
+                    continue
+                assert got.dtype == expected.dtype and got.shape == expected.shape
+                assert torch.equal(got, f.get_tensor(name))
+    finally:
+        swapped.close()
+    assert not [t.name for t in threading.enumerate() if t.name.startswith("spyre-swap")]
 
 
 def test_random_delays_and_failures_leave_nothing_behind(monkeypatch):

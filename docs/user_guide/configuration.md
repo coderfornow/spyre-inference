@@ -361,7 +361,8 @@ loader.
 The writes run on threads, each converting one tensor to the device format on a host
 core. `--model-loader-extra-config '{"num_threads": 4}'` sets how many; the default is
 8, or torch's thread count when that is lower, and the limit is 16. With tensor
-parallelism every rank starts its own threads.
+parallelism every rank starts its own threads. On a big-endian host (s390x) the same
+number of threads also converts each checkpoint tensor to host byte order.
 
 ## Model runner
 
