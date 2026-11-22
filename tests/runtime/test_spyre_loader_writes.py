@@ -22,6 +22,7 @@ write, ordering, the byte budget, failures and what is left behind. The device t
 import contextlib
 import itertools
 import mmap
+import os
 import random
 import sys
 import threading
@@ -290,12 +291,18 @@ def test_pages_are_released_only_inside_the_checkpoint_mapping(tmp_path, monkeyp
         assert len(calls) == 1
 
 
-def test_swapped_checkpoint_matches_safetensors(tmp_path, monkeypatch):
+@pytest.mark.parametrize("threads", [1, 4])
+def test_swapped_checkpoint_matches_safetensors(tmp_path, monkeypatch, threads):
     monkeypatch.setattr(loader_module, "_MIN_SWAP_CHUNK", 64)
+    # Smaller than a chunk and not a divisor of one, so blocks end mid-chunk.
+    monkeypatch.setattr(loader_module, "_SWAP_BLOCK", 40)
     tensors = {
         "bf16": torch.randn(33, 65).to(torch.bfloat16),
         "f16": torch.randn(7, 129).to(torch.float16),
         "f32": torch.randn(1000),
+        "f64": torch.randn(131, dtype=torch.float64),
+        "i16": torch.arange(-300, 301, dtype=torch.int16),
+        "i32": torch.arange(-500, 500, dtype=torch.int32),
         "i64": torch.arange(-500, 500),
         "scalar": torch.tensor(3.5),
         "empty": torch.empty(0, 4),
@@ -303,16 +310,28 @@ def test_swapped_checkpoint_matches_safetensors(tmp_path, monkeypatch):
     }
     path = tmp_path / "model.safetensors"
     save_file(tensors, str(path))
-    swapped = _SwappedCheckpoint(str(path), 4)
-    try:
-        with safe_open(str(path), framework="pt", device="cpu") as f:
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        swapped = _SwappedCheckpoint(str(path), threads, f)
+        try:
             for name, expected in tensors.items():
                 got = swapped.get_tensor(name)
-                if name in ("empty", "u8"):
-                    assert got is None
-                    continue
                 assert got.dtype == expected.dtype and got.shape == expected.shape
                 assert torch.equal(got, f.get_tensor(name))
+        finally:
+            swapped.close()
+    with pytest.raises(OSError):
+        os.fstat(swapped._fd)
+    assert not [t.name for t in threading.enumerate() if t.name.startswith("spyre-swap")]
+
+
+def test_swapped_checkpoint_rejects_a_truncated_file(tmp_path):
+    path = tmp_path / "model.safetensors"
+    save_file({"w": torch.randn(64, 64)}, str(path))
+    os.truncate(path, path.stat().st_size - 100)
+    swapped = _SwappedCheckpoint(str(path), 2, None)
+    try:
+        with pytest.raises(OSError, match="Short read"):
+            swapped.get_tensor("w")
     finally:
         swapped.close()
     assert not [t.name for t in threading.enumerate() if t.name.startswith("spyre-swap")]

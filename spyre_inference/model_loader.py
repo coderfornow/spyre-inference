@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import copy
 import ctypes
@@ -48,6 +49,7 @@ from spyre_inference.custom_ops.linear import (
     swapped_weight_layout,
     whole_swapped_weight,
 )
+from spyre_inference.moe import _prep_thread, _start_prep_thread
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -59,13 +61,6 @@ _MAX_LOAD_THREADS = 16
 # Bytes of checkpoint tensors queued or being written at once. The device runtime converts
 # each write on the host first, so this also bounds that staging.
 _MAX_OUTSTANDING_BYTES = 2 << 30
-
-_load_thread = threading.local()
-
-
-def _start_load_thread(device_index: int) -> None:
-    torch.spyre.set_device(device_index)
-    _load_thread.stream = torch.spyre.Stream()
 
 
 def _copy_to_card(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -89,7 +84,7 @@ class _CardWrites:
             ThreadPoolExecutor(
                 max_workers=threads,
                 thread_name_prefix="spyre-load",
-                initializer=_start_load_thread,
+                initializer=_start_prep_thread,
                 initargs=(torch.spyre.current_device(),),
             )
             if threads > 1
@@ -104,7 +99,9 @@ class _CardWrites:
         self._mapped: list[tuple[int, int]] = []
 
     def submit(self, dst: torch.Tensor, src: torch.Tensor) -> None:
-        if not whole_swapped_weight(dst) and not src.is_contiguous():
+        # Also raises for a row slice off the stick grid, whatever the source.
+        whole = whole_swapped_weight(dst)
+        if not whole and not src.is_contiguous():
             mapped = src
             src = src.contiguous()
             self.release_pages(mapped)
@@ -113,24 +110,24 @@ class _CardWrites:
             self.release_pages(src)
             return
 
-        first = int(dst.storage_offset())
+        storage, first = dst.untyped_storage()._cdata, int(dst.storage_offset())
+        last = first + _span(dst)
         nbytes = src.numel() * src.element_size()
-        entry = (dst.untyped_storage()._cdata, first, first + _span(dst), nbytes)
-        with self._cond:
+        entry = (storage, first, last, nbytes)
+
+        def admitted() -> bool:
             # A second write to the same elements lands after the first. One write is
             # always admitted, so a tensor above the budget cannot hang.
-            self._cond.wait_for(
-                lambda: (
-                    self._error is not None
-                    or (
-                        not any(
-                            s == entry[0] and lo < entry[2] and first < hi
-                            for s, lo, hi, _ in self._pending
-                        )
-                        and (not self._pending or self._bytes + nbytes <= _MAX_OUTSTANDING_BYTES)
-                    )
-                )
+            overlaps = any(
+                s == storage and lo < last and first < hi for s, lo, hi, _ in self._pending
             )
+            return self._error is not None or (
+                not overlaps
+                and (not self._pending or self._bytes + nbytes <= _MAX_OUTSTANDING_BYTES)
+            )
+
+        with self._cond:
+            self._cond.wait_for(admitted)
             if self._error is not None:
                 raise self._error
             self._pending.append(entry)
@@ -140,18 +137,20 @@ class _CardWrites:
     def _write(
         self, dst: torch.Tensor, src: torch.Tensor, entry: tuple[int, int, int, int]
     ) -> None:
-        error = None
         try:
-            with torch.spyre.stream(_load_thread.stream):
+            with torch.spyre.stream(_prep_thread.stream):
                 _copy_to_card(dst, src)
             self.release_pages(src)
         except BaseException as e:
-            error = e
-        with self._cond:
-            self._error = self._error or error
-            self._pending.remove(entry)
-            self._bytes -= entry[3]
-            self._cond.notify_all()
+            # The kept traceback holds this frame; do not let it pin the tensors too.
+            del dst, src
+            with self._cond:
+                self._error = self._error or e
+        finally:
+            with self._cond:
+                self._pending.remove(entry)
+                self._bytes -= entry[3]
+                self._cond.notify_all()
 
     def wait(self) -> None:
         with self._cond:
@@ -210,51 +209,64 @@ _SWAPPED_DTYPES = {
 }
 _SWAPPED_INTS = {2: torch.int16, 4: torch.int32, 8: torch.int64}
 _MIN_SWAP_CHUNK = 1 << 20
+_SWAP_BLOCK = 4 << 20
 
 
 class _SwappedCheckpoint:
-    """A safetensors file's tensors in host byte order, converted on threads.
+    """A safetensors file's tensors in host byte order, read and converted on threads.
 
     For a big-endian host: safetensors swaps each tensor on the calling thread under the
     GIL, which is most of a load there. The heap copy is the one it makes too."""
 
-    def __init__(self, path: str, threads: int) -> None:
-        with open(path, "rb") as f:
-            header_len = int.from_bytes(f.read(8), "little")
-            self._header = json.loads(f.read(header_len))
-            self._map = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    def __init__(self, path: str, threads: int, unswapped) -> None:
+        """`unswapped` is the file's safetensors handle, for dtypes with nothing to swap."""
+        self._path = path
+        self._fd = os.open(path, os.O_RDONLY)
+        header_len = int.from_bytes(os.pread(self._fd, 8, 0), "little")
+        self._header = json.loads(os.pread(self._fd, header_len, 8))
         self._base = 8 + header_len
+        self._unswapped = unswapped
         self._threads = threads
         self._pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="spyre-swap")
 
-    def get_tensor(self, name: str) -> torch.Tensor | None:
-        """None for a dtype with nothing to swap; safetensors reads those."""
+    def get_tensor(self, name: str) -> torch.Tensor:
         info = self._header[name]
         dtype = _SWAPPED_DTYPES.get(info["dtype"])
         start, end = (self._base + offset for offset in info["data_offsets"])
         if dtype is None or end == start:
-            return None
+            return self._unswapped.get_tensor(name)
         size = dtype.itemsize
-        src = np.frombuffer(self._map, f"<i{size}", (end - start) // size, start)
-        out = torch.empty(src.size, dtype=_SWAPPED_INTS[size])
+        out = torch.empty((end - start) // size, dtype=_SWAPPED_INTS[size])
         dst = out.numpy()
-        step = max(-(-src.size // self._threads), _MIN_SWAP_CHUNK)
-        list(
-            self._pool.map(
-                lambda i: np.copyto(dst[i : i + step], src[i : i + step]),
-                range(0, src.size, step),
+        step = max(-(-dst.size // self._threads), _MIN_SWAP_CHUNK)
+        if dst.size <= step:
+            self._read(dst, start)
+        else:
+            list(
+                self._pool.map(
+                    lambda i: self._read(dst[i : i + step], start + i * size),
+                    range(0, dst.size, step),
+                )
             )
-        )
-        if sys.platform == "linux":
-            page = mmap.PAGESIZE
-            first = -(-start // page) * page
-            if end // page * page > first:
-                self._map.madvise(mmap.MADV_DONTNEED, first, end // page * page - first)
         return out.view(dtype).reshape(info["shape"])
+
+    def _read(self, dst: np.ndarray, offset: int) -> None:
+        # Through a small block rather than a mapping: mapped pages cost a fault each and
+        # a release on the calling thread, and numpy's in-place byteswap holds the GIL.
+        block = np.empty(min(dst.size, _SWAP_BLOCK // dst.itemsize), dst.dtype.newbyteorder("<"))
+        raw = block.data.cast("B")
+        for i in range(0, dst.size, block.size):
+            part = dst[i : i + block.size]
+            read = os.preadv(self._fd, [raw[: part.nbytes]], offset + i * dst.itemsize)
+            if read < part.nbytes:
+                raise OSError(
+                    f"Short read from {self._path}: expected {part.nbytes} bytes, read {read}"
+                )
+            np.copyto(part, block[: part.size])
 
     def close(self) -> None:
         self._pool.shutdown()
-        self._map.close()
+        os.close(self._fd)
 
 
 _active_writes: contextvars.ContextVar[_CardWrites | None] = contextvars.ContextVar(
@@ -351,22 +363,21 @@ class SpyreModelLoader(BaseModelLoader):
         _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
         writes = _active_writes.get()
         for index, shard_path in enumerate(shard_files, 1):
-            swapped = (
-                _SwappedCheckpoint(shard_path, self._threads()) if sys.byteorder == "big" else None
-            )
-            try:
-                with safe_open(shard_path, framework="pt", device="cpu") as f:
-                    if writes is not None:
-                        writes.map_file(shard_path)
-                    for name in f.offset_keys():
-                        tensor = swapped.get_tensor(name) if swapped is not None else None
-                        yield name, f.get_tensor(name) if tensor is None else tensor
-                    if writes is not None:
-                        writes.wait()
-                        writes.map_file(None)
-            finally:
-                if swapped is not None:
-                    swapped.close()
+            with (
+                safe_open(shard_path, framework="pt", device="cpu") as f,
+                contextlib.ExitStack() as stack,
+            ):
+                reader = f
+                if sys.byteorder == "big":
+                    reader = _SwappedCheckpoint(shard_path, self._threads(), f)
+                    stack.callback(reader.close)
+                if writes is not None:
+                    writes.map_file(shard_path)
+                for name in f.offset_keys():
+                    yield name, reader.get_tensor(name)
+                if writes is not None:
+                    writes.wait()
+                    writes.map_file(None)
             logger.info(
                 "SpyreModelLoader: %d of %d checkpoint files written", index, len(shard_files)
             )
